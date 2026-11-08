@@ -65,7 +65,7 @@ Groups are a pair of maps in this process: group to connections, and connection 
 
 ## Security
 
-Origin handling is described on `WithOriginPatterns`. A missing `Origin` is allowed because non-browser clients omit it; browsers send it. That check is not authentication. Frame bodies are not logged. The read limit is 32 KiB.
+Origin handling is described on `WithOriginPatterns`. A missing `Origin` is allowed because non-browser clients omit it; browsers send it. That check is not authentication. Frame bodies are not logged. The default payload limit is 32 KiB.
 
 The application terminates TLS. Behind a reverse proxy, the proxy must forward `Connection: Upgrade` and `Upgrade: websocket` without buffering the byte stream. `RemoteAddr` is the peer the HTTP server sees. This library does not read `X-Forwarded-For`; a proxy can put a trusted address on the request before the handler runs.
 

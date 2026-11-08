@@ -225,7 +225,7 @@ Disconnect reasons: `ReasonClientClose`, `ReasonServerClose`, `ReasonShutdown`, 
 
 ## Scaling
 
-Everything in this process is local. Connection ids are random 16-byte values from `crypto/rand`. They are not coordinated across instances. There is no shared bus. See `docs/architecture.md` for the delivery and deployment boundaries.
+Everything in this process is local. Connection ids are random 16-byte values from `crypto/rand`. They are not coordinated across instances. There is no shared bus. See `docs/architecture.md` for the delivery and deployment boundaries. `docs/performance.md` is one measured run of the in-memory benchmarks, not a capacity guarantee.
 
 ## License
 

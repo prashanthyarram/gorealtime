@@ -11,3 +11,6 @@ race:
 
 vet:
 	go vet ./...
+
+bench:
+	go test -bench=. -benchmem -count=3 -run='^$$' .

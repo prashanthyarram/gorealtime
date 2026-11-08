@@ -17,6 +17,8 @@ type scriptSession struct {
 	closed  chan struct{}
 	got     [][]byte
 	inWrite atomic.Int32
+	discard bool
+	sink    int
 }
 
 func newScriptSession(block bool) *scriptSession {
@@ -47,6 +49,10 @@ func (s *scriptSession) Write(ctx context.Context, p []byte) error {
 		wake := s.wake
 		s.mu.Unlock()
 		if !block {
+			if s.discard {
+				s.sink += len(p)
+				return nil
+			}
 			s.mu.Lock()
 			s.got = append(s.got, append([]byte(nil), p...))
 			s.mu.Unlock()
@@ -89,7 +95,7 @@ func (s *scriptSession) frames() [][]byte {
 	return out
 }
 
-func attachLocal(t *testing.T, srv *Server, sess session, queue int, slow time.Duration) *Connection {
+func attachLocal(t testing.TB, srv *Server, sess session, queue int, slow time.Duration) *Connection {
 	t.Helper()
 	id, err := newID()
 	if err != nil {
