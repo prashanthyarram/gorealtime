@@ -2,7 +2,7 @@
 
 `gorealtime` is a Go library for process-local realtime delivery over WebSocket. You mount it on your own `net/http` server, and it accepts sockets, assigns a connection id, and keeps the connection until the peer leaves or you shut the server down.
 
-It does not implement a chat product. It does not store messages, users, or memberships, and it does not speak the SignalR protocol. Authentication and authorization belong to the application. Those pieces are not in this module yet either: handlers, identity, groups, and backpressure land in later milestones. The sections below describe what the code does today.
+It does not implement a chat product. It does not store messages, users, or memberships, and it does not speak the SignalR protocol. Authentication and authorization belong to the application. Heartbeats and an auth hook are not in this module yet. The sections below describe what the code does today.
 
 ## Install
 
@@ -72,7 +72,7 @@ conn.Close()
 
 Do not call `Shutdown` from a connect or disconnect hook. The hook runs on the connection goroutine, and `Shutdown` waits for it.
 
-Hooks must not assume they can send an application event. Sending to other connections is a later milestone. A handler can fail an event, and the server answers with an error frame.
+A handler can call `Send`, `Broadcast`, or `SendToGroup`. Those calls queue a frame; they do not write the socket on the read goroutine. A handler can also fail an event, and the server answers with an error frame.
 
 ## Events
 
@@ -98,6 +98,39 @@ return gorealtime.WithMessage(gorealtime.ErrUnauthorized, "not a member")
 `OnAck` observes an application ack. An ack means the peer claims to have seen a frame id. It does not mean the server will retry anything.
 
 `WithMaxPayloadBytes` sets the payload cap. The default is 32 KiB. The legal range is 1 byte to 8 MiB. The read limit is that value plus 4 KiB.
+
+## Sending
+
+`Send` queues one event for one connection. `SendToIdentity` queues it for every connection with that identity. `Broadcast` queues it for every connection. `SendToGroup` queues it for the members of a process-local group. The JSON is encoded once and the same frame is queued to each target. `ExcludeConnections` skips ids.
+
+```go
+err := srv.Send(ctx, conn.ID(), "chat.message", map[string]string{"text": "hi"})
+err = conn.Send(ctx, "echo", ev.Payload)
+err = srv.SendToGroup(ctx, "room-123", "chat.message", ev.Payload, gorealtime.ExcludeConnections(conn.ID()))
+```
+
+`nil` payload is JSON `null`. A `[]byte` or `json.RawMessage` must already be JSON; it is not wrapped again. Any other value is encoded with `encoding/json`.
+
+The call returns when the frame is queued, not when the client has read it. A canceled context skips the insert. A full queue returns `ErrQueueFull` and the frame is dropped. If that connection's queue stays full for the slow-consumer timeout (default 15s), a later rejected send returns `ErrSlowConsumer` and the connection is closed. `WithSlowConsumerTimeout(0)` disables that close. `WithQueueSize` sets the depth (default 32, maximum 4096).
+
+One slow connection does not stop a broadcast. Every target is attempted. The first queue error is returned.
+
+`ErrConnectionNotFound` means the id or identity is not registered. `ErrServerClosed` means `Shutdown` has started.
+
+Outbound memory is about `connections × queue size × frame size`, plus the frame currently being written. There is no separate global byte cap.
+
+## Groups
+
+Groups exist only in this process. `Join` and `AddToGroup` are trusted. The library does not decide who may join; the handler that calls `Join` does. A disconnect removes the connection from every group. Names use the same token grammar as event names.
+
+```go
+if err := conn.Join("room-123"); err != nil {
+    return err
+}
+log.Println(srv.GroupSize("room-123"))
+```
+
+`examples/groups` broadcasts a line to a room. `examples/chat` keeps an in-memory slice of lines, maps a server-side demo token to an identity, and then asks the library to deliver. The slice is not inside the library.
 
 `Handler` is an `http.Handler` for a router other than `ServeMux`. It does not look at the request path. `RegisterRoutes` is what mounts it at `Path`.
 

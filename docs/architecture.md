@@ -55,7 +55,13 @@ Each connection has one read goroutine. `coder/websocket` adds its timeout gorou
 
 `docs/protocol.md` is the envelope. Version 1 JSON text frames. `internal/protocol` encodes and validates them and does not import the server. Client `origin` is ignored. The server stamps its instance id on frames it creates.
 
-Handlers run sequentially on the connection read goroutine. That keeps order and caps handler goroutines at one per connection. Error replies are written from that goroutine between reads. A bounded outbound queue is not in place yet, so a handler cannot fan out to other connections without blocking on a write.
+Handlers run sequentially on the connection read goroutine. That keeps order and caps handler goroutines at one per connection.
+
+Outbound data frames share one bounded queue per connection and one write goroutine. Hello, error replies, and application events are ordered by enqueue. A send returns when the frame is queued. A full queue returns `ErrQueueFull` without waiting. The connection records the time it first became saturated. A later rejection after the slow-consumer timeout (default 15 seconds) closes it with `slow_consumer`. A successful enqueue clears that timer. Zero timeout leaves the connection up and still returns `ErrQueueFull`.
+
+Fan-out encodes once. The frame slice is immutable after encoding and is queued to each target as-is. Server WebSocket frames are not masked, and the write copies into its own buffer, so sharing the slice does not race. Closed connections are skipped. One full queue does not stop the rest of a broadcast.
+
+Groups are a pair of maps in this process: group to connections, and connection to groups. Disconnect removes both. There is no cross-instance membership.
 
 ## Security
 
@@ -65,11 +71,12 @@ The application terminates TLS. Behind a reverse proxy, the proxy must forward `
 
 ## What this release is not
 
-Delivery is not durable. A write that has not been attempted is dropped when the socket closes. There is no Redis, NATS, or other shared bus. Groups, when they exist, will be local to the process. A future distributed broadcast has to land on the instance that owns the connection and be written there. `origin` and frame ids are the hooks that adapter will use to avoid loops. Redis Pub/Sub is not a durable queue, and this library will not pretend otherwise.
+Delivery is not durable. A frame that has not been written is dropped when the socket closes. There is no Redis, NATS, or other shared bus. Groups are local to the process. A future distributed broadcast has to land on the instance that owns the connection and be written there. `origin` and frame ids are the hooks that adapter will use to avoid loops. Redis Pub/Sub is not a durable queue, and this library will not pretend otherwise.
 
 ## Current limitations
 
-- There is no outbound queue, broadcast, or group. A handler cannot send an application event. Error replies and hello are written on the connection goroutine. A slow reader is not disconnected, and a handler that writes later will block that connection's reads.
-- There is no heartbeat. A peer that stops reading and stops responding can sit in the read loop until the TCP session dies or the server shuts down. The read limit bounds one frame.
+- There is no heartbeat. A peer that stops reading and never fills the outbound queue can sit in the read loop until the TCP session dies or the server shuts down. A peer that stops reading and is still sent events is bounded by the queue and, by default, closed after 15 seconds of saturation.
 - Server-initiated close aborts the TCP connection. It does not wait for a WebSocket close handshake, because that handshake needs the read lock the reader is holding. Shutdown does not send an application goodbye frame.
 - `OnDisconnect` does not run when `OnConnect` fails or panics. It runs after the current handler returns when the read loop is what performs cleanup.
+- Group membership and broadcast do not leave this process. There is no authorizer on `Join` yet. The application has to refuse the join itself.
+- A queued frame is not a delivered frame. Nothing is replayed after a reconnect.

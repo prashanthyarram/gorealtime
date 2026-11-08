@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"path"
 	"strings"
+	"time"
 )
 
 const (
@@ -12,7 +13,10 @@ const (
 	defaultMaxPayload = 32 * 1024
 	// maxPayloadLimit caps a single payload so a configuration cannot ask
 	// for an unbounded read buffer.
-	maxPayloadLimit = 8 << 20
+	maxPayloadLimit    = 8 << 20
+	defaultQueueSize   = 32
+	maxQueueSize       = 4096
+	defaultSlowTimeout = 15 * time.Second
 )
 
 // Option configures a Server. Options are applied in order at NewServer.
@@ -24,13 +28,17 @@ type options struct {
 	originPatterns     []string
 	insecureSkipOrigin bool
 	maxPayload         int
+	queueSize          int
+	slowTimeout        time.Duration
 }
 
 func defaultOptions() options {
 	return options{
-		path:       defaultPath,
-		log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
-		maxPayload: defaultMaxPayload,
+		path:        defaultPath,
+		log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		maxPayload:  defaultMaxPayload,
+		queueSize:   defaultQueueSize,
+		slowTimeout: defaultSlowTimeout,
 	}
 }
 
@@ -85,10 +93,6 @@ func WithOriginPatterns(patterns ...string) Option {
 	}
 }
 
-// WithInsecureSkipOriginCheck disables Origin verification.
-// Any web page can then open a connection. Use it for local development or
-// for a listener that is not reachable by browsers. Do not use it on a
-// browser-facing deployment.
 // WithMaxPayloadBytes sets the maximum JSON payload size in bytes.
 // The WebSocket read limit is this value plus 4 KiB for the envelope.
 // n must be between 1 and 8 MiB inclusive. Any other value panics.
@@ -102,6 +106,35 @@ func WithMaxPayloadBytes(n int) Option {
 	}
 }
 
+// WithQueueSize sets how many outbound frames each connection buffers.
+// n must be between 1 and 4096. The default is 32.
+// A full queue rejects the send. It does not grow.
+func WithQueueSize(n int) Option {
+	return func(o *options) {
+		if n < 1 || n > maxQueueSize {
+			panic("gorealtime: queue size must be between 1 and 4096")
+		}
+		o.queueSize = n
+	}
+}
+
+// WithSlowConsumerTimeout closes a connection that stays queue-full for d.
+// The clock starts on the first rejected enqueue and resets when an enqueue
+// succeeds. Zero disables the close; callers still receive ErrQueueFull.
+// A negative duration panics. The default is 15 seconds.
+func WithSlowConsumerTimeout(d time.Duration) Option {
+	return func(o *options) {
+		if d < 0 {
+			panic("gorealtime: slow consumer timeout must not be negative")
+		}
+		o.slowTimeout = d
+	}
+}
+
+// WithInsecureSkipOriginCheck disables Origin verification.
+// Any web page can then open a connection. Use it for local development or
+// for a listener that is not reachable by browsers. Do not use it on a
+// browser-facing deployment.
 func WithInsecureSkipOriginCheck() Option {
 	return func(o *options) {
 		o.insecureSkipOrigin = true

@@ -167,12 +167,11 @@ func (s *Server) writeError(c *Connection, corr, code, public string) error {
 		s.opts.log.Error("frame.encode", "id", c.ID(), "err", err.Error())
 		return fmt.Errorf("%w: %v", ErrSerialization, err)
 	}
-	return s.writeFrame(c, frame)
-}
-
-func (s *Server) writeFrame(c *Connection, frame []byte) error {
-	if err := c.writeRaw(frame); err != nil {
-		s.opts.log.Info("connection.write", "id", c.ID(), "err", boundErr(err))
+	if err := c.enqueue(context.Background(), frame); err != nil {
+		if errors.Is(err, ErrQueueFull) || errors.Is(err, ErrSlowConsumer) {
+			s.opts.log.Info("connection.write", "id", c.ID(), "err", err.Error())
+			return nil
+		}
 		return err
 	}
 	return nil

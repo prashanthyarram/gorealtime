@@ -31,6 +31,23 @@ var (
 	// ErrUnauthorized is returned by application code that rejects an event.
 	// The library does not decide authorization by itself.
 	ErrUnauthorized = errors.New("gorealtime: unauthorized")
+
+	// ErrConnectionNotFound means the connection id or identity is not registered.
+	ErrConnectionNotFound = errors.New("gorealtime: connection not found")
+
+	// ErrServerClosed means the server is no longer accepting or delivering.
+	ErrServerClosed = errors.New("gorealtime: server closed")
+
+	// ErrQueueFull means the connection's outbound queue rejected a frame.
+	ErrQueueFull = errors.New("gorealtime: outbound queue full")
+
+	// ErrSlowConsumer means the queue stayed full long enough that the
+	// connection is being closed.
+	ErrSlowConsumer = errors.New("gorealtime: slow consumer")
+
+	// ErrInvalidGroup means the group name is empty or not a token,
+	// or the operation does not apply.
+	ErrInvalidGroup = errors.New("gorealtime: invalid group operation")
 )
 
 // Client-visible error codes. They travel in error envelopes.

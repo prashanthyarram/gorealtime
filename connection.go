@@ -6,8 +6,6 @@ import (
 	"sync"
 	"time"
 	"unicode"
-
-	"github.com/prashanth-yarram/gorealtime/internal/ws"
 )
 
 const (
@@ -50,6 +48,7 @@ const (
 	ReasonReadError       = "read_error"
 	ReasonWriteError      = "write_error"
 	ReasonConnectRejected = "connect_rejected"
+	ReasonSlowConsumer    = "slow_consumer"
 )
 
 // Info is a snapshot of a connection. Metadata is a copy.
@@ -65,6 +64,8 @@ type Info struct {
 	LastWriteAt      time.Time
 	State            State
 	DisconnectReason string
+	QueueLen         int
+	Groups           []string
 }
 
 // ConnectHandler runs after the handshake and before the hello frame.
@@ -89,9 +90,11 @@ type DisconnectHandler func(ctx context.Context, conn *Connection, reason string
 type Connection struct {
 	id          string
 	remoteAddr  string
-	sess        *ws.Session
+	sess        session
 	server      *Server
 	connectedAt time.Time
+	out         chan []byte
+	slowTimeout time.Duration
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -106,10 +109,11 @@ type Connection struct {
 	reading     bool
 	lastReadAt  time.Time
 	lastWriteAt time.Time
+	saturatedAt time.Time
 	finishOnce  sync.Once
 }
 
-func newConnection(id, remote string, sess *ws.Session, server *Server) *Connection {
+func newConnection(id, remote string, sess session, server *Server) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Connection{
 		id:          id,
@@ -193,15 +197,26 @@ func (c *Connection) State() State {
 }
 
 // Info returns a snapshot. LastReadAt or LastWriteAt is zero when that
-// direction has not yet seen a data frame.
+// direction has not yet seen a data frame. QueueLen and Groups are
+// snapshots and may change immediately.
 func (c *Connection) Info() Info {
+	var groups []string
+	if c.server != nil {
+		groups = c.server.groups.list(c.id)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	qlen := 0
+	if c.out != nil {
+		qlen = len(c.out)
+	}
 	return Info{
 		ID:               c.id,
 		Identity:         c.identity,
 		RemoteAddr:       c.remoteAddr,
 		Metadata:         copyMeta(c.meta),
+		QueueLen:         qlen,
+		Groups:           groups,
 		ConnectedAt:      c.connectedAt,
 		LastReadAt:       c.lastReadAt,
 		LastWriteAt:      c.lastWriteAt,
@@ -257,6 +272,82 @@ func (c *Connection) markWrite() {
 	c.mu.Unlock()
 }
 
+func (c *Connection) configureQueue(size int, slow time.Duration) {
+	if size < 1 {
+		size = 1
+	}
+	c.out = make(chan []byte, size)
+	c.slowTimeout = slow
+}
+
+// enqueue queues one immutable frame. It does not wait for the socket.
+// A full queue returns ErrQueueFull, or ErrSlowConsumer once the connection
+// has stayed saturated for its timeout.
+func (c *Connection) enqueue(ctx context.Context, frame []byte) error {
+	if c.out == nil {
+		return ErrConnectionClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-c.ctx.Done():
+		return ErrConnectionClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	case c.out <- frame:
+		c.clearSaturated()
+		return nil
+	default:
+	}
+	if c.markSaturated() {
+		c.signalClose(ReasonSlowConsumer)
+		return ErrSlowConsumer
+	}
+	return ErrQueueFull
+}
+
+func (c *Connection) clearSaturated() {
+	c.mu.Lock()
+	c.saturatedAt = time.Time{}
+	c.mu.Unlock()
+}
+
+func (c *Connection) markSaturated() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state == StateClosed {
+		return false
+	}
+	now := time.Now()
+	if c.saturatedAt.IsZero() {
+		c.saturatedAt = now
+	}
+	if c.slowTimeout <= 0 {
+		return false
+	}
+	return now.Sub(c.saturatedAt) >= c.slowTimeout
+}
+
+// writeLoop is the only goroutine that writes data frames for c.
+func (c *Connection) writeLoop() {
+	defer c.server.wg.Done()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case frame := <-c.out:
+			if err := c.writeRaw(frame); err != nil {
+				c.signalClose(ReasonWriteError)
+				return
+			}
+		}
+	}
+}
+
 // finish closes the socket, drops indexes, and runs OnDisconnect at most once.
 // The first reason is kept.
 func (c *Connection) finish(reason string) {
@@ -276,6 +367,7 @@ func (c *Connection) finish(reason string) {
 		}
 		if c.server != nil {
 			_ = c.server.reg.remove(c)
+			c.server.groups.drop(c)
 			c.server.opts.log.Info("connection.close", "id", c.id, "reason", reason)
 			if established {
 				c.server.fireDisconnect(c, reason)

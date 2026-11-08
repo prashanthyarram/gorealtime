@@ -36,7 +36,8 @@ type Server struct {
 	opts       options
 	instanceID string
 
-	reg registry
+	reg    registry
+	groups groupTable
 
 	hookMu       sync.Mutex
 	onConnect    []ConnectHandler
@@ -65,6 +66,7 @@ func NewServer(opts ...Option) *Server {
 		opts:       o,
 		instanceID: mustInstanceID(),
 		reg:        newRegistry(),
+		groups:     newGroupTable(),
 		shutDone:   make(chan struct{}),
 	}
 }
@@ -197,11 +199,12 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c := newConnection(id, r.RemoteAddr, sess, s)
-	if !s.reg.tryAdd(c) {
+	c.configureQueue(s.opts.queueSize, s.opts.slowTimeout)
+	if !s.reg.insert(c, func() { s.wg.Add(2) }) {
 		c.finish(ReasonShutdown)
 		return
 	}
-	s.wg.Add(1)
+	go c.writeLoop()
 	go s.runConnection(c)
 }
 
@@ -244,15 +247,11 @@ func (s *Server) runConnection(c *Connection) {
 		s.opts.log.Error("connection.hello", "id", c.ID(), "err", err.Error())
 		return
 	}
-	wctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
-	err = c.sess.Write(wctx, hello)
-	cancel()
-	if err != nil {
+	if err := c.enqueue(context.Background(), hello); err != nil {
 		reason = ReasonWriteError
 		s.opts.log.Info("connection.hello", "id", c.ID(), "err", boundErr(err))
 		return
 	}
-	c.markWrite()
 
 	// context.Background is intentional. coder/websocket treats cancellation
 	// of the read context as a failed read and closes the socket, so a read

@@ -23,6 +23,13 @@ func newRegistry() registry {
 
 // tryAdd inserts c if the server is still accepting and the id is free.
 func (r *registry) tryAdd(c *Connection) bool {
+	return r.insert(c, nil)
+}
+
+// insert registers c. track runs under the registry lock only after c is
+// visible, so Shutdown's Wait cannot observe zero goroutines for a
+// connection that was already published.
+func (r *registry) insert(c *Connection, track func()) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.accepting {
@@ -32,6 +39,9 @@ func (r *registry) tryAdd(c *Connection) bool {
 		return false
 	}
 	r.byID[c.id] = c
+	if track != nil {
+		track()
+	}
 	return true
 }
 

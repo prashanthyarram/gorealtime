@@ -135,10 +135,18 @@ func DecodeClient(data []byte, maxPayload int) (Envelope, error) {
 	return env, nil
 }
 
-// ValidateEventName reports whether name is a non-empty ASCII token.
+// ValidateEventName reports whether name is a non-empty ASCII token of at most 128 bytes.
 func ValidateEventName(name string) error {
 	if err := validateToken(name, maxEventBytes, false); err != nil {
 		return fmt.Errorf("%w: %v", ErrEvent, err)
+	}
+	return nil
+}
+
+// ValidateID reports whether id is a non-empty ASCII token of at most 64 bytes.
+func ValidateID(id string) error {
+	if err := validateToken(id, maxIDBytes, false); err != nil {
+		return fmt.Errorf("%w: id", ErrField)
 	}
 	return nil
 }
