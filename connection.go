@@ -103,6 +103,7 @@ type Connection struct {
 	state       State
 	reason      string
 	established bool
+	reading     bool
 	lastReadAt  time.Time
 	lastWriteAt time.Time
 	finishOnce  sync.Once
@@ -209,10 +210,39 @@ func (c *Connection) Info() Info {
 	}
 }
 
-// Close starts cleanup with ReasonServerClose.
-// It is safe to call more than once. Later calls do not change the first reason.
+// Close asks the connection to stop with ReasonServerClose.
+// It is safe to call more than once. The first reason wins.
+//
+// When the read loop is running, Close cancels Context and aborts the socket,
+// and the read loop runs OnDisconnect after the current handler returns.
+// Close itself does not wait for that. A handler must return when ctx is done
+// and must not wait for another frame on this connection.
 func (c *Connection) Close() {
-	c.finish(ReasonServerClose)
+	c.signalClose(ReasonServerClose)
+}
+
+// signalClose records reason and either finishes now or wakes the read loop.
+// The read loop finishes when it is already running, so OnDisconnect does not
+// overlap the handler.
+func (c *Connection) signalClose(reason string) {
+	c.mu.Lock()
+	if c.state == StateClosed {
+		c.mu.Unlock()
+		return
+	}
+	if c.reason == "" {
+		c.reason = reason
+	}
+	reading := c.reading
+	c.mu.Unlock()
+	if !reading {
+		c.finish(reason)
+		return
+	}
+	c.cancel()
+	if c.sess != nil {
+		_ = c.sess.CloseNow()
+	}
 }
 
 func (c *Connection) markRead() {

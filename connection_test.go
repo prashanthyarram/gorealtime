@@ -260,6 +260,16 @@ func TestCloseOnceAndShutdownReason(t *testing.T) {
 	}
 	wg.Wait()
 	waitCount(t, s, 0)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := len(reasons)
+		mu.Unlock()
+		if n >= 1 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	mu.Lock()
 	if len(reasons) != 1 || reasons[0] != ReasonServerClose {
 		t.Fatalf("reasons %v", reasons)

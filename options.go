@@ -7,7 +7,13 @@ import (
 	"strings"
 )
 
-const defaultPath = "/realtime"
+const (
+	defaultPath       = "/realtime"
+	defaultMaxPayload = 32 * 1024
+	// maxPayloadLimit caps a single payload so a configuration cannot ask
+	// for an unbounded read buffer.
+	maxPayloadLimit = 8 << 20
+)
 
 // Option configures a Server. Options are applied in order at NewServer.
 type Option func(*options)
@@ -17,12 +23,14 @@ type options struct {
 	log                *slog.Logger
 	originPatterns     []string
 	insecureSkipOrigin bool
+	maxPayload         int
 }
 
 func defaultOptions() options {
 	return options{
-		path: defaultPath,
-		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		path:       defaultPath,
+		log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		maxPayload: defaultMaxPayload,
 	}
 }
 
@@ -81,6 +89,19 @@ func WithOriginPatterns(patterns ...string) Option {
 // Any web page can then open a connection. Use it for local development or
 // for a listener that is not reachable by browsers. Do not use it on a
 // browser-facing deployment.
+// WithMaxPayloadBytes sets the maximum JSON payload size in bytes.
+// The WebSocket read limit is this value plus 4 KiB for the envelope.
+// n must be between 1 and 8 MiB inclusive. Any other value panics.
+// The default is 32 KiB.
+func WithMaxPayloadBytes(n int) Option {
+	return func(o *options) {
+		if n < 1 || n > maxPayloadLimit {
+			panic("gorealtime: max payload must be between 1 byte and 8 MiB")
+		}
+		o.maxPayload = n
+	}
+}
+
 func WithInsecureSkipOriginCheck() Option {
 	return func(o *options) {
 		o.insecureSkipOrigin = true

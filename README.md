@@ -72,7 +72,32 @@ conn.Close()
 
 Do not call `Shutdown` from a connect or disconnect hook. The hook runs on the connection goroutine, and `Shutdown` waits for it.
 
-Hooks must not assume they can send on the socket. Sending is a later milestone. Hello is the only server frame today.
+Hooks must not assume they can send an application event. Sending to other connections is a later milestone. A handler can fail an event, and the server answers with an error frame.
+
+## Events
+
+Register a handler before or after the server is accepting. A second registration for the same name replaces the first. Handlers for one connection run one at a time on that connection's read goroutine, in the order the frames arrived. Do not wait for another frame on the same connection. Do not call `Shutdown` from a handler. Return when `ctx` ends.
+
+```go
+srv.On("chat.send", func(ctx context.Context, conn *gorealtime.Connection, ev gorealtime.Event) error {
+    if len(ev.Payload) == 0 {
+        return gorealtime.ErrInvalidPayload
+    }
+    return nil
+})
+```
+
+The client sends a version 1 JSON text frame. `docs/protocol.md` is the envelope. `ev.Payload` is the raw JSON value and belongs to the handler. Binary frames, bad JSON, unknown events, and handler errors produce an `error` frame and leave the socket open. A frame larger than the read limit closes the socket.
+
+```go
+return gorealtime.WithMessage(gorealtime.ErrUnauthorized, "not a member")
+```
+
+`WithMessage` is the sentence the client sees. Any other handler error is logged on the server and reported as `handler_failed` with a fixed sentence. A panic is recovered, logged with its stack, and reported the same way. Do not put secrets in errors you return; those strings are logged. Payload bytes are not logged.
+
+`OnAck` observes an application ack. An ack means the peer claims to have seen a frame id. It does not mean the server will retry anything.
+
+`WithMaxPayloadBytes` sets the payload cap. The default is 32 KiB. The legal range is 1 byte to 8 MiB. The read limit is that value plus 4 KiB.
 
 `Handler` is an `http.Handler` for a router other than `ServeMux`. It does not look at the request path. `RegisterRoutes` is what mounts it at `Path`.
 

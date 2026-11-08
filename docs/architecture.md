@@ -51,15 +51,11 @@ The registry mutex guards the accepting flag and both indexes. It is not held du
 
 Each connection has one read goroutine. `coder/websocket` adds its timeout goroutine. `Shutdown` waits until the library's goroutines finish. `sync.Once` makes cleanup run once if the read loop, `Close`, and shutdown overlap.
 
-## Protocol so far
+## Protocol
 
-Only the server sends a frame today, and only at accept:
+`docs/protocol.md` is the envelope. Version 1 JSON text frames. `internal/protocol` encodes and validates them and does not import the server. Client `origin` is ignored. The server stamps its instance id on frames it creates.
 
-```json
-{"v":1,"type":"hello","id":"<event-id>","origin":"<instance-id>","payload":{"connectionId":"<connection-id>"}}
-```
-
-`v` is the protocol version. `type` distinguishes the frame. `id` identifies this frame, not the connection. The connection id is inside `payload` because it is hello-specific data. Inbound data frames are read and discarded until the event milestone. Reading them is required for control frames.
+Handlers run sequentially on the connection read goroutine. That keeps order and caps handler goroutines at one per connection. Error replies are written from that goroutine between reads. A bounded outbound queue is not in place yet, so a handler cannot fan out to other connections without blocking on a write.
 
 ## Security
 
@@ -73,8 +69,7 @@ Delivery is not durable. A write that has not been attempted is dropped when the
 
 ## Current limitations
 
-- Inbound application frames are discarded. There is no handler API yet.
-- There is no outbound queue, broadcast, or group. Hello is a single write on the connection goroutine. A slow reader is not disconnected.
-- There is no heartbeat. A peer that stops reading and stops responding can sit in the read loop until the TCP session dies or the server shuts down. The read limit still bounds memory of a single frame.
-- Server-initiated close aborts the TCP connection after `CloseNow`. It does not wait for a WebSocket close handshake, because that handshake needs the read lock the reader is holding. Shutdown does not send an application goodbye frame.
-- `OnDisconnect` does not run when `OnConnect` fails, panics, or closes the socket itself.
+- There is no outbound queue, broadcast, or group. A handler cannot send an application event. Error replies and hello are written on the connection goroutine. A slow reader is not disconnected, and a handler that writes later will block that connection's reads.
+- There is no heartbeat. A peer that stops reading and stops responding can sit in the read loop until the TCP session dies or the server shuts down. The read limit bounds one frame.
+- Server-initiated close aborts the TCP connection. It does not wait for a WebSocket close handshake, because that handshake needs the read lock the reader is holding. Shutdown does not send an application goodbye frame.
+- `OnDisconnect` does not run when `OnConnect` fails or panics. It runs after the current handler returns when the read loop is what performs cleanup.

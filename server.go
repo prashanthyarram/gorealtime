@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -12,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prashanth-yarram/gorealtime/internal/protocol"
 	"github.com/prashanth-yarram/gorealtime/internal/ws"
 )
 
@@ -41,6 +41,8 @@ type Server struct {
 	hookMu       sync.Mutex
 	onConnect    []ConnectHandler
 	onDisconnect []DisconnectHandler
+	handlers     map[string]Handler
+	onAck        AckHandler
 
 	shutOnce sync.Once
 	shutDone chan struct{}
@@ -154,7 +156,7 @@ func (s *Server) beginShutdown() {
 	s.shutOnce.Do(func() {
 		conns := s.reg.drain()
 		for _, c := range conns {
-			c.finish(ReasonShutdown)
+			c.signalClose(ReasonShutdown)
 		}
 		go func() {
 			s.wg.Wait()
@@ -185,7 +187,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	sess, err := ws.Upgrade(w, r, ws.Config{
 		OriginPatterns:     s.opts.originPatterns,
 		InsecureSkipOrigin: s.opts.insecureSkipOrigin,
-		ReadLimit:          ws.DefaultReadLimit,
+		ReadLimit:          int64(s.opts.maxPayload) + protocol.MaxOverhead,
 	})
 	if err != nil {
 		// Accept already wrote the status. Log a bounded error string and
@@ -207,6 +209,17 @@ func (s *Server) runConnection(c *Connection) {
 	defer s.wg.Done()
 	reason := ReasonReadError
 	defer func() { c.finish(reason) }()
+
+	c.mu.Lock()
+	c.reading = true
+	if c.state == StateClosed {
+		if c.reason != "" {
+			reason = c.reason
+		}
+		c.mu.Unlock()
+		return
+	}
+	c.mu.Unlock()
 
 	if err := s.runConnectHooks(c); err != nil {
 		reason = ReasonConnectRejected
@@ -244,10 +257,9 @@ func (s *Server) runConnection(c *Connection) {
 	// context.Background is intentional. coder/websocket treats cancellation
 	// of the read context as a failed read and closes the socket, so a read
 	// deadline cannot be expressed that way. CloseNow unblocks this call.
-	// Inbound data frames are discarded until the dispatcher exists. Reading
-	// them is what lets the transport handle ping, pong, and close.
+	// Handlers run inline on this goroutine, one event at a time.
 	for {
-		_, _, err := c.sess.Read(context.Background())
+		binary, data, err := c.sess.Read(context.Background())
 		if err != nil {
 			var ce *ws.CloseError
 			if errors.As(err, &ce) {
@@ -259,6 +271,10 @@ func (s *Server) runConnection(c *Connection) {
 			return
 		}
 		c.markRead()
+		if err := s.handleFrame(c, binary, data); err != nil {
+			reason = ReasonWriteError
+			return
+		}
 	}
 }
 
@@ -321,30 +337,6 @@ func (s *Server) disconnectHooks() []DisconnectHandler {
 	out := make([]DisconnectHandler, len(s.onDisconnect))
 	copy(out, s.onDisconnect)
 	return out
-}
-
-type helloMessage struct {
-	V       int          `json:"v"`
-	Type    string       `json:"type"`
-	ID      string       `json:"id"`
-	Origin  string       `json:"origin"`
-	Payload helloPayload `json:"payload"`
-}
-
-type helloPayload struct {
-	ConnectionID string `json:"connectionId"`
-}
-
-func encodeHello(eventID, instanceID, connectionID string) ([]byte, error) {
-	return json.Marshal(helloMessage{
-		V:      1,
-		Type:   "hello",
-		ID:     eventID,
-		Origin: instanceID,
-		Payload: helloPayload{
-			ConnectionID: connectionID,
-		},
-	})
 }
 
 func newID() (string, error) {
