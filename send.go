@@ -142,12 +142,18 @@ func (s *Server) SendToGroup(ctx context.Context, group, event string, payload a
 // AddToGroup joins connID to a process-local group.
 // The group is created if needed. This is a trusted server call.
 func (s *Server) AddToGroup(connID, group string) error {
+	if err := validateGroup(group); err != nil {
+		return err
+	}
 	c, ok := s.reg.get(connID)
 	if !ok {
 		if !s.reg.acceptingNow() {
 			return ErrServerClosed
 		}
 		return ErrConnectionNotFound
+	}
+	if err := s.authorizeGroup(c, group, GroupJoin); err != nil {
+		return err
 	}
 	return s.groups.add(c, group)
 }
@@ -164,6 +170,9 @@ func (s *Server) RemoveFromGroup(connID, group string) error {
 		}
 		return ErrConnectionNotFound
 	}
+	if err := s.authorizeGroup(c, group, GroupLeave); err != nil {
+		return err
+	}
 	s.groups.remove(c, group)
 	return nil
 }
@@ -172,21 +181,32 @@ func (s *Server) RemoveFromGroup(connID, group string) error {
 func (s *Server) GroupSize(group string) int { return s.groups.size(group) }
 
 // Join adds this connection to a process-local group.
+// AuthorizeGroups, when set, runs first with action GroupJoin.
 func (c *Connection) Join(group string) error {
 	if c.server == nil {
 		return ErrConnectionClosed
+	}
+	if err := validateGroup(group); err != nil {
+		return err
+	}
+	if err := c.server.authorizeGroup(c, group, GroupJoin); err != nil {
+		return err
 	}
 	return c.server.groups.add(c, group)
 }
 
 // Leave removes this connection from the group.
 // Leaving a group the connection is not in is not an error.
+// AuthorizeGroups, when set, runs first with action GroupLeave.
 func (c *Connection) Leave(group string) error {
 	if err := validateGroup(group); err != nil {
 		return err
 	}
 	if c.server == nil {
 		return ErrConnectionClosed
+	}
+	if err := c.server.authorizeGroup(c, group, GroupLeave); err != nil {
+		return err
 	}
 	c.server.groups.remove(c, group)
 	return nil

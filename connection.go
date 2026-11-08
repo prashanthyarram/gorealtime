@@ -2,10 +2,13 @@ package gorealtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/prashanth-yarram/gorealtime/internal/protocol"
 )
 
 const (
@@ -49,6 +52,8 @@ const (
 	ReasonWriteError      = "write_error"
 	ReasonConnectRejected = "connect_rejected"
 	ReasonSlowConsumer    = "slow_consumer"
+	// ReasonHeartbeat means a ping did not observe a pong before the heartbeat timeout.
+	ReasonHeartbeat = "heartbeat_timeout"
 )
 
 // Info is a snapshot of a connection. Metadata is a copy.
@@ -98,9 +103,16 @@ type Connection struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+	// stop is closed to ask the write goroutine to send bye and abort.
+	stop chan struct{}
+	// live is closed once the read goroutine is inside Read.
+	// Heartbeats wait for that so a pong has a reader to observe it.
+	live chan struct{}
 
 	// mu guards the fields below. Take the registry lock first if both are needed.
 	mu          sync.Mutex
+	stopClosed  bool
+	liveOnce    sync.Once
 	identity    string
 	meta        map[string]string
 	state       State
@@ -123,6 +135,8 @@ func newConnection(id, remote string, sess session, server *Server) *Connection 
 		connectedAt: time.Now(),
 		ctx:         ctx,
 		cancel:      cancel,
+		stop:        make(chan struct{}),
+		live:        make(chan struct{}),
 		meta:        make(map[string]string),
 		state:       StateConnecting,
 	}
@@ -305,7 +319,13 @@ func (c *Connection) enqueue(ctx context.Context, frame []byte) error {
 	}
 	if c.markSaturated() {
 		c.signalClose(ReasonSlowConsumer)
+		if c.server != nil {
+			c.server.noteSlowConsumer()
+		}
 		return ErrSlowConsumer
+	}
+	if c.server != nil {
+		c.server.noteQueueSaturated()
 	}
 	return ErrQueueFull
 }
@@ -332,20 +352,192 @@ func (c *Connection) markSaturated() bool {
 	return now.Sub(c.saturatedAt) >= c.slowTimeout
 }
 
+// applyAuth records the identity and metadata chosen before upgrade.
+// The connection must already be registered. Invalid values are rejected
+// earlier; this fails when the connection has already closed.
+func (c *Connection) applyAuth(identity string, meta map[string]string) error {
+	if identity != "" {
+		if err := c.SetIdentity(identity); err != nil {
+			return err
+		}
+	}
+	for k, v := range meta {
+		if err := c.SetMetadata(k, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// enableHeartbeat tells the write goroutine that Read is running.
+func (c *Connection) enableHeartbeat() {
+	c.liveOnce.Do(func() { close(c.live) })
+}
+
+// requestStop records reason and asks the write goroutine to send bye.
+// If the read loop has not started, cleanup runs immediately and no bye is sent.
+func (c *Connection) requestStop(reason string) {
+	c.mu.Lock()
+	if c.state == StateClosed {
+		c.mu.Unlock()
+		return
+	}
+	if c.reason == "" {
+		c.reason = reason
+	}
+	reading := c.reading
+	if !c.stopClosed {
+		c.stopClosed = true
+		close(c.stop)
+	}
+	c.mu.Unlock()
+	if !reading {
+		c.finish(reason)
+	}
+}
+
+func (c *Connection) stopRequested() bool {
+	select {
+	case <-c.stop:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Connection) armReason(reason string) {
+	c.mu.Lock()
+	if c.reason == "" {
+		c.reason = reason
+	}
+	c.mu.Unlock()
+}
+
+func (c *Connection) disarmReason(reason string) {
+	c.mu.Lock()
+	if c.state != StateClosed && c.reason == reason {
+		c.reason = ""
+	}
+	c.mu.Unlock()
+}
+
 // writeLoop is the only goroutine that writes data frames for c.
 func (c *Connection) writeLoop() {
 	defer c.server.wg.Done()
+	var (
+		ping   <-chan time.Time
+		live   <-chan struct{}
+		ticker *time.Ticker
+	)
+	live = c.live
+	defer func() {
+		if ticker != nil {
+			ticker.Stop()
+		}
+	}()
 	for {
+		if c.stopRequested() {
+			c.exitShutdown()
+			return
+		}
 		select {
 		case <-c.ctx.Done():
 			return
+		case <-c.stop:
+			c.exitShutdown()
+			return
+		case <-live:
+			live = nil
+			interval := time.Duration(0)
+			if c.server != nil {
+				interval = c.server.opts.heartbeat
+			}
+			if interval > 0 && ticker == nil {
+				ticker = time.NewTicker(interval)
+				ping = ticker.C
+			}
+		case <-ping:
+			c.armReason(ReasonHeartbeat)
+			err := c.ping()
+			if err != nil {
+				if c.server != nil {
+					c.server.noteWriteFailed()
+				}
+				c.signalClose(ReasonHeartbeat)
+				return
+			}
+			c.disarmReason(ReasonHeartbeat)
 		case frame := <-c.out:
 			if err := c.writeRaw(frame); err != nil {
+				if c.server != nil {
+					c.server.noteWriteFailed()
+				}
 				c.signalClose(ReasonWriteError)
 				return
 			}
+			if c.server != nil {
+				c.server.noteFrameWritten()
+			}
 		}
 	}
+}
+
+func (c *Connection) exitShutdown() {
+	c.writeBye()
+	c.signalClose(ReasonShutdown)
+}
+
+func (c *Connection) writeBye() {
+	if c.server == nil || c.sess == nil {
+		return
+	}
+	payload, err := json.Marshal(struct {
+		Reason string `json:"reason"`
+	}{Reason: ReasonShutdown})
+	if err != nil {
+		return
+	}
+	frame, err := protocol.Encode(protocol.Envelope{
+		Type:    protocol.TypeBye,
+		Origin:  c.server.instanceID,
+		Payload: payload,
+	})
+	if err != nil {
+		return
+	}
+	_ = c.writeRaw(frame)
+}
+
+func (c *Connection) frameWriteTimeout() time.Duration {
+	if c != nil && c.server != nil && c.server.opts.writeTimeout > 0 {
+		return c.server.opts.writeTimeout
+	}
+	return 10 * time.Second
+}
+
+func (c *Connection) ping() error {
+	if c.sess == nil {
+		return ErrConnectionClosed
+	}
+	timeout := 10 * time.Second
+	if c.server != nil && c.server.opts.heartbeatTimeout > 0 {
+		timeout = c.server.opts.heartbeatTimeout
+	}
+	pctx, cancel := context.WithTimeout(context.Background(), timeout)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-c.stop:
+			cancel()
+		case <-c.ctx.Done():
+			cancel()
+		case <-done:
+		}
+	}()
+	err := c.sess.Ping(pctx)
+	close(done)
+	cancel()
+	return err
 }
 
 // finish closes the socket, drops indexes, and runs OnDisconnect at most once.
@@ -369,6 +561,7 @@ func (c *Connection) finish(reason string) {
 			_ = c.server.reg.remove(c)
 			c.server.groups.drop(c)
 			c.server.opts.log.Info("connection.close", "id", c.id, "reason", reason)
+			c.server.noteClosed(reason)
 			if established {
 				c.server.fireDisconnect(c, reason)
 			}

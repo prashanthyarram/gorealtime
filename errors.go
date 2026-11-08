@@ -28,8 +28,8 @@ var (
 	// ErrSerialization is returned when a frame cannot be encoded.
 	ErrSerialization = errors.New("gorealtime: serialization failed")
 
-	// ErrUnauthorized is returned by application code that rejects an event.
-	// The library does not decide authorization by itself.
+	// ErrUnauthorized is returned when an authenticator, authorizer, or the
+	// application rejects a handshake, event, or group operation.
 	ErrUnauthorized = errors.New("gorealtime: unauthorized")
 
 	// ErrConnectionNotFound means the connection id or identity is not registered.

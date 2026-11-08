@@ -104,6 +104,12 @@ func (s *Server) dispatchEvent(c *Connection, env protocol.Envelope) error {
 		Payload:       append([]byte(nil), env.Payload...),
 		Trace:         copyTrace(env.Trace),
 	}
+	if err := s.authorizeEvent(c, ev.Name); err != nil {
+		s.opts.log.Info("event.denied", "id", c.ID(), "event", ev.Name, "err", boundErr(err))
+		code, msg := clientFault(err)
+		return s.writeError(c, env.ID, code, msg)
+	}
+	s.noteEventReceived()
 	h := s.handlerFor(ev.Name)
 	if h == nil {
 		s.opts.log.Info("event.unknown", "id", c.ID(), "event", ev.Name)
@@ -146,6 +152,9 @@ func (s *Server) callHandler(c *Connection, name string, fn func() error) (err e
 				"stack", string(debug.Stack()),
 			)
 			err = fmt.Errorf("%w: panic", ErrHandlerFailed)
+		}
+		if err != nil {
+			s.noteHandlerFailed()
 		}
 	}()
 	return fn()
@@ -249,7 +258,7 @@ func (c *Connection) writeRaw(frame []byte) error {
 	if c.sess == nil {
 		return ErrConnectionClosed
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), c.frameWriteTimeout())
 	err := c.sess.Write(ctx, frame)
 	cancel()
 	if err != nil {

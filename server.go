@@ -15,10 +15,6 @@ import (
 	"github.com/prashanth-yarram/gorealtime/internal/ws"
 )
 
-// writeTimeout bounds a single outbound frame in this milestone.
-// Later milestones make the write timeout configurable.
-const writeTimeout = 10 * time.Second
-
 // RouteRegistrar is the part of a router required to mount the handshake.
 // *http.ServeMux implements it. Third-party routers that provide Handle do too.
 type RouteRegistrar interface {
@@ -44,6 +40,8 @@ type Server struct {
 	onDisconnect []DisconnectHandler
 	handlers     map[string]Handler
 	onAck        AckHandler
+	eventAuth    EventAuthorizer
+	groupAuth    GroupAuthorizer
 
 	shutOnce sync.Once
 	shutDone chan struct{}
@@ -158,7 +156,7 @@ func (s *Server) beginShutdown() {
 	s.shutOnce.Do(func() {
 		conns := s.reg.drain()
 		for _, c := range conns {
-			c.signalClose(ReasonShutdown)
+			c.requestStop(ReasonShutdown)
 		}
 		go func() {
 			s.wg.Wait()
@@ -176,6 +174,11 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if !s.reg.acceptingNow() {
 		http.Error(w, "server closed", http.StatusServiceUnavailable)
+		return
+	}
+
+	identity, meta, ok := s.authenticate(w, r)
+	if !ok {
 		return
 	}
 
@@ -204,6 +207,13 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		c.finish(ReasonShutdown)
 		return
 	}
+	if err := c.applyAuth(identity, meta); err != nil {
+		c.finish(ReasonConnectRejected)
+		s.wg.Done()
+		s.wg.Done()
+		return
+	}
+	s.noteOpened()
 	go c.writeLoop()
 	go s.runConnection(c)
 }
@@ -252,6 +262,9 @@ func (s *Server) runConnection(c *Connection) {
 		s.opts.log.Info("connection.hello", "id", c.ID(), "err", boundErr(err))
 		return
 	}
+
+	// Heartbeats start only once Read is the caller, so the pong has a reader.
+	c.enableHeartbeat()
 
 	// context.Background is intentional. coder/websocket treats cancellation
 	// of the read context as a failed read and closes the socket, so a read

@@ -13,10 +13,13 @@ const (
 	defaultMaxPayload = 32 * 1024
 	// maxPayloadLimit caps a single payload so a configuration cannot ask
 	// for an unbounded read buffer.
-	maxPayloadLimit    = 8 << 20
-	defaultQueueSize   = 32
-	maxQueueSize       = 4096
-	defaultSlowTimeout = 15 * time.Second
+	maxPayloadLimit         = 8 << 20
+	defaultQueueSize        = 32
+	maxQueueSize            = 4096
+	defaultSlowTimeout      = 15 * time.Second
+	defaultHeartbeat        = 30 * time.Second
+	defaultHeartbeatTimeout = 10 * time.Second
+	defaultWriteTimeout     = 10 * time.Second
 )
 
 // Option configures a Server. Options are applied in order at NewServer.
@@ -30,15 +33,24 @@ type options struct {
 	maxPayload         int
 	queueSize          int
 	slowTimeout        time.Duration
+	heartbeat          time.Duration
+	heartbeatTimeout   time.Duration
+	writeTimeout       time.Duration
+	requireAuth        bool
+	authenticator      Authenticator
+	metrics            *Metrics
 }
 
 func defaultOptions() options {
 	return options{
-		path:        defaultPath,
-		log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
-		maxPayload:  defaultMaxPayload,
-		queueSize:   defaultQueueSize,
-		slowTimeout: defaultSlowTimeout,
+		path:             defaultPath,
+		log:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		maxPayload:       defaultMaxPayload,
+		queueSize:        defaultQueueSize,
+		slowTimeout:      defaultSlowTimeout,
+		heartbeat:        defaultHeartbeat,
+		heartbeatTimeout: defaultHeartbeatTimeout,
+		writeTimeout:     defaultWriteTimeout,
 	}
 }
 
@@ -128,6 +140,64 @@ func WithSlowConsumerTimeout(d time.Duration) Option {
 			panic("gorealtime: slow consumer timeout must not be negative")
 		}
 		o.slowTimeout = d
+	}
+}
+
+// WithRequireAuth rejects the handshake with HTTP 401 when the identity is
+// empty after middleware and the authenticator. The socket is not opened.
+func WithRequireAuth() Option {
+	return func(o *options) {
+		o.requireAuth = true
+	}
+}
+
+// WithAuthenticator sets the callback that runs before the upgrade.
+// nil clears it. See Authenticator for what the callback may return.
+func WithAuthenticator(fn Authenticator) Option {
+	return func(o *options) {
+		o.authenticator = fn
+	}
+}
+
+// WithHeartbeat sets how often a ping is written and how long the pong may take.
+// The defaults are 30s and 10s. interval 0 disables heartbeats and ignores timeout.
+// A negative duration panics. A positive interval with a zero timeout panics.
+// Pings start after the read loop is blocked in Read.
+func WithHeartbeat(interval, timeout time.Duration) Option {
+	return func(o *options) {
+		switch {
+		case interval < 0 || timeout < 0:
+			panic("gorealtime: heartbeat duration must not be negative")
+		case interval == 0:
+			o.heartbeat = 0
+			o.heartbeatTimeout = 0
+		case timeout == 0:
+			panic("gorealtime: heartbeat timeout must be positive when heartbeats are enabled")
+		default:
+			o.heartbeat = interval
+			o.heartbeatTimeout = timeout
+		}
+	}
+}
+
+// WithWriteTimeout bounds one outbound data frame.
+// d must be positive and at most 2 minutes. The default is 10 seconds.
+// The write goroutine does not start another frame or a ping while a write
+// is in progress, so this also bounds how long a heartbeat can be delayed.
+func WithWriteTimeout(d time.Duration) Option {
+	return func(o *options) {
+		if d <= 0 || d > 2*time.Minute {
+			panic("gorealtime: write timeout must be positive and at most 2 minutes")
+		}
+		o.writeTimeout = d
+	}
+}
+
+// WithMetrics installs optional counters. nil clears them.
+// See Metrics for which funcs are called and what they are not given.
+func WithMetrics(m *Metrics) Option {
+	return func(o *options) {
+		o.metrics = m
 	}
 }
 

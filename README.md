@@ -2,7 +2,7 @@
 
 `gorealtime` is a Go library for process-local realtime delivery over WebSocket. You mount it on your own `net/http` server, and it accepts sockets, assigns a connection id, and keeps the connection until the peer leaves or you shut the server down.
 
-It does not implement a chat product. It does not store messages, users, or memberships, and it does not speak the SignalR protocol. Authentication and authorization belong to the application. Heartbeats and an auth hook are not in this module yet. The sections below describe what the code does today.
+It does not implement a chat product. It does not store messages, users, or memberships, and it does not speak the SignalR protocol. Authentication and authorization belong to the application. The library can require an identity, call an authenticator, and run authorizers the application supplies. It does not issue tokens or decide who may speak in a room.
 
 ## Install
 
@@ -134,6 +134,46 @@ log.Println(srv.GroupSize("room-123"))
 
 `Handler` is an `http.Handler` for a router other than `ServeMux`. It does not look at the request path. `RegisterRoutes` is what mounts it at `Path`.
 
+## Authentication
+
+Middleware can attach an identity before the handler runs:
+
+```go
+h := srv.Handler()
+http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    ctx := gorealtime.WithIdentity(r.Context(), "alice")
+    h.ServeHTTP(w, r.WithContext(ctx))
+})
+```
+
+`WithAuthenticator` runs on the HTTP request before the upgrade and replaces that identity. Return an error to refuse the handshake. `WithRequireAuth` answers HTTP 401 when the identity is still empty, and it does not open a socket. The 401 body is the word `unauthorized`. The server log records a bounded error string, not the request URI, headers, identity, or metadata. Do not put a token in the error you return.
+
+```go
+srv := gorealtime.NewServer(
+    gorealtime.WithRequireAuth(),
+    gorealtime.WithAuthenticator(func(ctx context.Context, r *http.Request) (gorealtime.AuthResult, error) {
+        if r.Header.Get("Authorization") != "Bearer demo-alice" {
+            return gorealtime.AuthResult{}, gorealtime.ErrUnauthorized
+        }
+        return gorealtime.AuthResult{Identity: "alice"}, nil
+    }),
+)
+```
+
+`AuthorizeEvents` runs before the handler. `ErrUnauthorized` becomes an error frame and leaves the socket open. `AuthorizeGroups` runs for `Join`, `Leave`, `AddToGroup`, and `RemoveFromGroup` with action `GroupJoin` or `GroupLeave`. It must not call those methods itself. `OnConnect` can still reject a socket that already upgraded.
+
+`examples/chat` does not use HTTP auth. It maps a server-side demo token inside an event handler, then calls `SetIdentity`. That token is not a user id supplied by the client as the identity.
+
+## Heartbeats and limits
+
+A ping is sent every 30s. The pong must arrive within 10s. `WithHeartbeat(interval, timeout)` changes both. `WithHeartbeat(0, 0)` disables them. Pings start once the read loop is blocked in `Read`, because that is where the transport observes the pong. A missed pong closes the connection with `ReasonHeartbeat`.
+
+`WithWriteTimeout` bounds one outbound frame. The default is 10s and the maximum is 2 minutes. `WithMaxPayloadBytes` bounds the JSON payload. The read limit is that value plus 4 KiB. There is no separate read-deadline context: canceling the context passed to `Read` closes the socket, so it cannot mean "wait for the next frame."
+
+## Metrics
+
+`WithMetrics` takes a `Metrics` value. Set the funcs you want. Nil funcs are skipped. Counts do not include payloads, identities, or tokens. `ConnectionClosed` receives a reason constant. A panic in a func is recovered and logged as `metrics.panic`. This module does not import Prometheus or OpenTelemetry.
+
 ## Configuration
 
 | Option | Behavior |
@@ -142,6 +182,14 @@ log.Println(srv.GroupSize("room-123"))
 | `WithLogger` | `*slog.Logger`. nil discards logs. Frame bodies are never logged. |
 | `WithOriginPatterns` | Extra Origin hosts allowed to complete the handshake. `*` and URL-shaped patterns panic. |
 | `WithInsecureSkipOriginCheck` | Disables the Origin check. Development only. |
+| `WithQueueSize` | Outbound frames buffered per connection. 1 to 4096, default 32. |
+| `WithSlowConsumerTimeout` | Close a connection that stays queue-full. Default 15s. Zero disables the close. |
+| `WithMaxPayloadBytes` | Maximum JSON payload. 1 byte to 8 MiB, default 32 KiB. |
+| `WithRequireAuth` | HTTP 401 when the handshake has no identity. |
+| `WithAuthenticator` | Callback before upgrade. Replaces the middleware identity. |
+| `WithHeartbeat` | Ping interval and pong timeout. Zero interval disables. Default 30s and 10s. |
+| `WithWriteTimeout` | One outbound frame. Default 10s, maximum 2 minutes. |
+| `WithMetrics` | Optional counters. nil funcs are skipped. |
 
 A missing `Origin` is allowed. A present `Origin` must match the request host or a pattern. That stops a browser page on another site from opening the socket. It does not authenticate the caller. Non-browser clients can send any `Origin` they want.
 
@@ -157,7 +205,7 @@ if err := srv.Shutdown(ctx); err != nil {
 }
 ```
 
-`Shutdown` stops new handshakes and aborts open sockets. It is safe to call more than once, including concurrently. A timed-out context does not reverse the shutdown; a later call with a live context waits for the same close to finish.
+`Shutdown` stops new handshakes. Each write loop then attempts one `bye` frame (`{"reason":"shutdown"}`) and aborts the TCP connection. Frames still sitting in the queue are dropped. `bye` is best-effort: a blocked write is bounded by `WithWriteTimeout`, and an in-flight ping is canceled. `Close` on one connection does not send `bye`. Shutdown is safe to call more than once, including concurrently. A timed-out context does not reverse it; a later call with a live context waits for the same close to finish.
 
 Call `Shutdown` even if you also call `http.Server.Shutdown`. Hijacked WebSocket connections stay up until this library closes them.
 
@@ -165,9 +213,15 @@ After shutdown, the handshake endpoint returns `503`.
 
 ## Errors and limits
 
-There is no exported error set yet. Failed handshakes use HTTP status codes: `405` for a non-GET, `403` for a rejected origin, `503` after shutdown, and the WebSocket library's status for a malformed upgrade.
+Sentinel errors: `ErrConnectionClosed`, `ErrInvalidIdentity`, `ErrInvalidMetadata`, `ErrInvalidEvent`, `ErrInvalidPayload`, `ErrPayloadTooLarge`, `ErrHandlerFailed`, `ErrSerialization`, `ErrUnauthorized`, `ErrConnectionNotFound`, `ErrServerClosed`, `ErrQueueFull`, `ErrSlowConsumer`, `ErrInvalidGroup`. `WithMessage` attaches the sentence a client may see. Other error text stays on the server.
 
-Each inbound frame is limited to 32 KiB. Each hello write is limited to 10 seconds. There is no heartbeat yet, so a half-open peer is not detected until the TCP session fails or the server shuts down.
+Client error codes: `CodeInvalidMessage`, `CodeInvalidEvent`, `CodeInvalidPayload`, `CodePayloadTooLarge`, `CodeHandlerFailed`, `CodeUnauthorized`.
+
+Handshake statuses: `401` when auth fails, `405` for a non-GET, `403` for a rejected origin, `503` after shutdown.
+
+Disconnect reasons: `ReasonClientClose`, `ReasonServerClose`, `ReasonShutdown`, `ReasonReadError`, `ReasonWriteError`, `ReasonConnectRejected`, `ReasonSlowConsumer`, `ReasonHeartbeat`. The first reason wins.
+
+`docs/security.md` is the threat boundary. `docs/protocol.md` is the envelope.
 
 ## Scaling
 

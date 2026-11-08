@@ -48,12 +48,12 @@ Codes:
 | `invalid_event` | Bad or unknown event name. |
 | `invalid_payload` | Payload is not JSON, or a handler returned `ErrInvalidPayload`. |
 | `payload_too_large` | Payload exceeds the configured maximum. |
-| `unauthorized` | A handler returned `ErrUnauthorized`. |
+| `unauthorized` | An authorizer or handler returned `ErrUnauthorized`. |
 | `handler_failed` | A handler returned another error, or panicked. |
 
 The `message` is a short public sentence. Handler error text is logged on the server and is not copied to the client unless the handler used `WithMessage`.
 
-`bye` is reserved for a later graceful-shutdown notice. Clients cannot send it.
+`bye` is a server frame sent once, best-effort, during `Shutdown`. The payload is `{"reason":"shutdown"}`. Clients cannot send `bye`. A queued application frame may be dropped instead of flushed.
 
 ## Limits
 

@@ -259,11 +259,20 @@ func TestShutdownIdempotentAndRejects(t *testing.T) {
 		t.Fatalf("status %d body %s", res.StatusCode, body)
 	}
 
-	// The peer blocked in a read must have been released. A second read returns.
+	// Shutdown may deliver one bye frame, then the socket closes.
 	rctx, rcancel := context.WithTimeout(context.Background(), time.Second)
 	defer rcancel()
-	if _, _, err := c.Read(rctx); err == nil {
-		t.Fatal("expected read to fail after shutdown")
+	_, data, err := c.Read(rctx)
+	if err == nil {
+		var env struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(data, &env) != nil || env.Type != "bye" {
+			t.Fatalf("unexpected frame %s", data)
+		}
+		if _, _, err := c.Read(rctx); err == nil {
+			t.Fatal("expected the socket to close after bye")
+		}
 	}
 }
 
