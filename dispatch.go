@@ -8,7 +8,7 @@ import (
 	"runtime/debug"
 	"unicode"
 
-	"github.com/prashanth-yarram/gorealtime/internal/protocol"
+	"github.com/prashanthyarram/gorealtime/internal/protocol"
 )
 
 // Event is one inbound application event.

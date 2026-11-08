@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/prashanth-yarram/gorealtime/internal/protocol"
+	"github.com/prashanthyarram/gorealtime/internal/protocol"
 )
 
 // SendOption adjusts one outbound event.

@@ -8,7 +8,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/prashanth-yarram/gorealtime/internal/protocol"
+	"github.com/prashanthyarram/gorealtime/internal/protocol"
 )
 
 const (

@@ -1,4 +1,4 @@
-module github.com/prashanth-yarram/gorealtime
+module github.com/prashanthyarram/gorealtime
 
 go 1.22.2
 

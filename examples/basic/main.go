@@ -13,7 +13,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/prashanth-yarram/gorealtime"
+	"github.com/prashanthyarram/gorealtime"
 )
 
 func main() {

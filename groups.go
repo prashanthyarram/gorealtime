@@ -2,7 +2,7 @@ package gorealtime
 
 import "sync"
 
-import "github.com/prashanth-yarram/gorealtime/internal/protocol"
+import "github.com/prashanthyarram/gorealtime/internal/protocol"
 
 // groupTable is process-local membership.
 // mu is independent of the registry lock. Do not take the registry lock

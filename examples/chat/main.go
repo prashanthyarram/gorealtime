@@ -18,7 +18,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/prashanth-yarram/gorealtime"
+	"github.com/prashanthyarram/gorealtime"
 )
 
 // tokens are server-side fixtures. A production handler would read an

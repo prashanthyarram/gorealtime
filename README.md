@@ -7,7 +7,7 @@ It does not implement a chat product. It does not store messages, users, or memb
 ## Install
 
 ```bash
-go get github.com/prashanth-yarram/gorealtime
+go get github.com/prashanthyarram/gorealtime
 ```
 
 The module requires Go 1.22. The WebSocket implementation is `github.com/coder/websocket` v1.8.13. The reason for that pin is in `docs/architecture.md`.
@@ -21,7 +21,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/prashanth-yarram/gorealtime"
+	"github.com/prashanthyarram/gorealtime"
 )
 
 func main() {

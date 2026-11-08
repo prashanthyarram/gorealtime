@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prashanth-yarram/gorealtime/internal/protocol"
-	"github.com/prashanth-yarram/gorealtime/internal/ws"
+	"github.com/prashanthyarram/gorealtime/internal/protocol"
+	"github.com/prashanthyarram/gorealtime/internal/ws"
 )
 
 // RouteRegistrar is the part of a router required to mount the handshake.
