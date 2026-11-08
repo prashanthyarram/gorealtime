@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -28,14 +30,17 @@ type RouteRegistrar interface {
 // The caller owns the HTTP server, TLS, and middleware. Register the handler
 // on the caller's mux. Shutdown stops new handshakes and closes open sockets.
 // Shutdown is safe to call more than once and from several goroutines.
+// Do not call Shutdown from a connection hook. The hook runs on the connection
+// goroutine, and Shutdown waits for that goroutine.
 type Server struct {
 	opts       options
 	instanceID string
 
-	// mu guards accepting and conns. Do not hold it across upgrade, read, or write.
-	mu        sync.Mutex
-	accepting bool
-	conns     map[string]*conn
+	reg registry
+
+	hookMu       sync.Mutex
+	onConnect    []ConnectHandler
+	onDisconnect []DisconnectHandler
 
 	shutOnce sync.Once
 	shutDone chan struct{}
@@ -57,8 +62,7 @@ func NewServer(opts ...Option) *Server {
 	return &Server{
 		opts:       o,
 		instanceID: mustInstanceID(),
-		accepting:  true,
-		conns:      make(map[string]*conn),
+		reg:        newRegistry(),
 		shutDone:   make(chan struct{}),
 	}
 }
@@ -72,11 +76,48 @@ func (s *Server) InstanceID() string { return s.instanceID }
 
 // ConnectionCount returns the number of connections currently registered.
 // The count includes a connection from the moment it is registered until
-// cleanup finishes.
-func (s *Server) ConnectionCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.conns)
+// cleanup finishes, including one still inside OnConnect.
+func (s *Server) ConnectionCount() int { return s.reg.count() }
+
+// Connection returns the registered connection with id.
+// A closed connection is absent. The bool is false when id is unknown.
+func (s *Server) Connection(id string) (*Connection, bool) { return s.reg.get(id) }
+
+// Connections returns a snapshot of registered connections.
+// The slice order is not defined. A connection in the slice may close
+// immediately after the call returns.
+func (s *Server) Connections() []*Connection { return s.reg.list() }
+
+// ConnectionsByIdentity returns a snapshot of connections indexed under identity.
+// The order is not defined. An empty identity is not indexed and returns nil.
+// Several connections may share one identity.
+func (s *Server) ConnectionsByIdentity(identity string) []*Connection {
+	if identity == "" {
+		return nil
+	}
+	return s.reg.byIdentity(identity)
+}
+
+// OnConnect registers a hook. Hooks run in registration order.
+// A nil hook panics. Registering from inside a hook is safe.
+func (s *Server) OnConnect(h ConnectHandler) {
+	if h == nil {
+		panic("gorealtime: nil connect handler")
+	}
+	s.hookMu.Lock()
+	s.onConnect = append(s.onConnect, h)
+	s.hookMu.Unlock()
+}
+
+// OnDisconnect registers a hook. Hooks run in registration order.
+// A nil hook panics.
+func (s *Server) OnDisconnect(h DisconnectHandler) {
+	if h == nil {
+		panic("gorealtime: nil disconnect handler")
+	}
+	s.hookMu.Lock()
+	s.onDisconnect = append(s.onDisconnect, h)
+	s.hookMu.Unlock()
 }
 
 // Handler is the handshake endpoint. Mount it at the path clients should dial.
@@ -94,6 +135,8 @@ func (s *Server) RegisterRoutes(mux RouteRegistrar) {
 // It waits until connection goroutines exit or ctx ends. A canceled ctx does
 // not undo the shutdown: later calls still report the closed state, and they
 // wait again with their own context. The first call performs the close.
+// Connections closed by Shutdown disconnect with ReasonShutdown when their
+// connect hook already succeeded.
 func (s *Server) Shutdown(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -109,13 +152,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 func (s *Server) beginShutdown() {
 	s.shutOnce.Do(func() {
-		s.mu.Lock()
-		s.accepting = false
-		conns := s.conns
-		s.conns = make(map[string]*conn)
-		s.mu.Unlock()
+		conns := s.reg.drain()
 		for _, c := range conns {
-			_ = c.sess.CloseNow()
+			c.finish(ReasonShutdown)
 		}
 		go func() {
 			s.wg.Wait()
@@ -131,10 +170,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	accepting := s.accepting
-	s.mu.Unlock()
-	if !accepting {
+	if !s.reg.acceptingNow() {
 		http.Error(w, "server closed", http.StatusServiceUnavailable)
 		return
 	}
@@ -158,42 +194,52 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c := &conn{
-		id:         id,
-		remoteAddr: r.RemoteAddr,
-		sess:       sess,
-	}
-
-	s.mu.Lock()
-	if !s.accepting {
-		s.mu.Unlock()
-		_ = sess.CloseNow()
+	c := newConnection(id, r.RemoteAddr, sess, s)
+	if !s.reg.tryAdd(c) {
+		c.finish(ReasonShutdown)
 		return
 	}
-	s.conns[c.id] = c
 	s.wg.Add(1)
-	s.mu.Unlock()
-
-	s.opts.log.Info("connection.open", "id", c.id, "remote", c.remoteAddr)
-	go s.readLoop(c)
+	go s.runConnection(c)
 }
 
-func (s *Server) readLoop(c *conn) {
+func (s *Server) runConnection(c *Connection) {
 	defer s.wg.Done()
-	defer s.detach(c)
+	reason := ReasonReadError
+	defer func() { c.finish(reason) }()
+
+	if err := s.runConnectHooks(c); err != nil {
+		reason = ReasonConnectRejected
+		s.opts.log.Info("connection.reject", "id", c.ID(), "err", boundErr(err))
+		return
+	}
+
+	c.mu.Lock()
+	if c.state == StateClosed {
+		c.mu.Unlock()
+		return
+	}
+	c.established = true
+	c.state = StateOpen
+	c.mu.Unlock()
+
+	s.opts.log.Info("connection.open", "id", c.ID(), "remote", c.remoteAddr)
 
 	hello, err := encodeHello(newEventID(), s.instanceID, c.id)
 	if err != nil {
-		s.opts.log.Error("connection.hello", "id", c.id, "err", err.Error())
+		reason = ReasonWriteError
+		s.opts.log.Error("connection.hello", "id", c.ID(), "err", err.Error())
 		return
 	}
 	wctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
 	err = c.sess.Write(wctx, hello)
 	cancel()
 	if err != nil {
-		s.opts.log.Info("connection.hello", "id", c.id, "err", boundErr(err))
+		reason = ReasonWriteError
+		s.opts.log.Info("connection.hello", "id", c.ID(), "err", boundErr(err))
 		return
 	}
+	c.markWrite()
 
 	// context.Background is intentional. coder/websocket treats cancellation
 	// of the read context as a failed read and closes the socket, so a read
@@ -205,25 +251,76 @@ func (s *Server) readLoop(c *conn) {
 		if err != nil {
 			var ce *ws.CloseError
 			if errors.As(err, &ce) {
-				s.opts.log.Info("connection.close", "id", c.id, "status", ce.Code)
+				reason = ReasonClientClose
+				s.opts.log.Info("connection.read", "id", c.ID(), "status", ce.Code)
 			} else {
-				s.opts.log.Info("connection.close", "id", c.id, "err", boundErr(err))
+				s.opts.log.Info("connection.read", "id", c.ID(), "err", boundErr(err))
 			}
 			return
 		}
+		c.markRead()
 	}
 }
 
-func (s *Server) detach(c *conn) {
-	c.once.Do(func() {
-		s.mu.Lock()
-		if cur, ok := s.conns[c.id]; ok && cur == c {
-			delete(s.conns, c.id)
+func (s *Server) runConnectHooks(c *Connection) error {
+	for _, h := range s.connectHooks() {
+		if err := s.callConnect(c, h); err != nil {
+			return err
 		}
-		s.mu.Unlock()
-		_ = c.sess.CloseNow()
-		s.opts.log.Info("connection.detach", "id", c.id)
-	})
+		if c.State() == StateClosed {
+			return ErrConnectionClosed
+		}
+	}
+	return nil
+}
+
+func (s *Server) callConnect(c *Connection, h ConnectHandler) (err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			s.opts.log.Error("hook.panic",
+				"hook", "connect",
+				"id", c.ID(),
+				"panic", fmt.Sprint(rec),
+				"stack", string(debug.Stack()),
+			)
+			err = fmt.Errorf("connect hook panic: %v", rec)
+		}
+	}()
+	return h(c.Context(), c)
+}
+
+func (s *Server) fireDisconnect(c *Connection, reason string) {
+	for _, h := range s.disconnectHooks() {
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					s.opts.log.Error("hook.panic",
+						"hook", "disconnect",
+						"id", c.ID(),
+						"panic", fmt.Sprint(rec),
+						"stack", string(debug.Stack()),
+					)
+				}
+			}()
+			h(c.Context(), c, reason)
+		}()
+	}
+}
+
+func (s *Server) connectHooks() []ConnectHandler {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	out := make([]ConnectHandler, len(s.onConnect))
+	copy(out, s.onConnect)
+	return out
+}
+
+func (s *Server) disconnectHooks() []DisconnectHandler {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	out := make([]DisconnectHandler, len(s.onDisconnect))
+	copy(out, s.onDisconnect)
+	return out
 }
 
 type helloMessage struct {

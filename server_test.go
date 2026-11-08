@@ -125,11 +125,20 @@ func TestInboundFrameIsIgnoredAndNotLogged(t *testing.T) {
 	if err := c.Write(ctx, websocket.MessageText, []byte(secret)); err != nil {
 		t.Fatal(err)
 	}
-	// Give the server a moment to read the frame. The connection must stay up.
-	time.Sleep(50 * time.Millisecond)
-	if s.ConnectionCount() != 1 {
-		t.Fatalf("count = %d", s.ConnectionCount())
+	deadline := time.Now().Add(time.Second)
+	saw := false
+	for time.Now().Before(deadline) {
+		conns := s.Connections()
+		if len(conns) == 1 && !conns[0].Info().LastReadAt.IsZero() {
+			saw = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
+	if !saw || s.ConnectionCount() != 1 {
+		t.Fatalf("frame not consumed, count = %d", s.ConnectionCount())
+	}
+	shutdown(t, s)
 	if strings.Contains(buf.String(), secret) {
 		t.Fatalf("payload leaked into logs: %s", buf.String())
 	}

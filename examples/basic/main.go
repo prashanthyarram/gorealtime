@@ -8,6 +8,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -17,6 +18,13 @@ import (
 
 func main() {
 	srv := gorealtime.NewServer(gorealtime.WithPath("/realtime"))
+	srv.OnConnect(func(ctx context.Context, conn *gorealtime.Connection) error {
+		log.Printf("open %s", conn.ID())
+		return nil
+	})
+	srv.OnDisconnect(func(ctx context.Context, conn *gorealtime.Connection, reason string) {
+		log.Printf("close %s %s", conn.ID(), reason)
+	})
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

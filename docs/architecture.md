@@ -35,11 +35,21 @@ One `Server` is an in-memory registry plus an `http.Handler`. The caller runs `h
 
 Connection ids are 16 random bytes, hex-encoded, from `crypto/rand`. They are unique within a process with overwhelming probability. They are not leased across instances. The instance id is the same kind of value, minted once per `Server`, and placed on server-originated frames as `origin`.
 
+## Connections
+
+Each socket is a `Connection`. The registry is two maps under one mutex: connection id, and identity to the set of connections that currently use it. Identity is optional and application-defined. Empty identity is not indexed. `sync.Map` is not used.
+
+Lock order is the registry mutex, then the connection mutex. `SetIdentity` holds the registry lock across the index update, so a lookup that returns after `SetIdentity` returns does not still find the old identity.
+
+`OnConnect` runs on the connection goroutine before hello. Failure and panics reject the socket and do not call `OnDisconnect`. Panics are recovered and logged with a stack. `OnDisconnect` runs after the socket is closed, only if connect succeeded. Hooks must not call `Shutdown`.
+
+Cleanup is `sync.Once`. The first reason is kept.
+
 ## Concurrency
 
-`Server.mu` guards the accepting flag and the connection map. It is not held during network IO. The post-upgrade insert rechecks the accepting flag under that lock so shutdown and accept cannot lose a socket or add one after close.
+The registry mutex guards the accepting flag and both indexes. It is not held during network IO. The post-upgrade insert rechecks the accepting flag under that lock so shutdown and accept cannot lose a socket or add one after close.
 
-Each connection has one read goroutine. `coder/websocket` adds its timeout goroutine. `Shutdown` waits until the library's goroutines finish. `sync.Once` makes detach run once if the read loop and shutdown overlap.
+Each connection has one read goroutine. `coder/websocket` adds its timeout goroutine. `Shutdown` waits until the library's goroutines finish. `sync.Once` makes cleanup run once if the read loop, `Close`, and shutdown overlap.
 
 ## Protocol so far
 
@@ -64,8 +74,7 @@ Delivery is not durable. A write that has not been attempted is dropped when the
 ## Current limitations
 
 - Inbound application frames are discarded. There is no handler API yet.
-- Connections cannot be looked up by an application identity. Several sockets per identity are not tracked.
-- There is no outbound queue, broadcast, or group.
+- There is no outbound queue, broadcast, or group. Hello is a single write on the connection goroutine. A slow reader is not disconnected.
 - There is no heartbeat. A peer that stops reading and stops responding can sit in the read loop until the TCP session dies or the server shuts down. The read limit still bounds memory of a single frame.
-- Server-initiated close aborts the TCP connection after `CloseNow`. It does not wait for a WebSocket close handshake, because that handshake needs the read lock the reader is holding.
-- `Shutdown` closing the socket does not send an application goodbye frame yet.
+- Server-initiated close aborts the TCP connection after `CloseNow`. It does not wait for a WebSocket close handshake, because that handshake needs the read lock the reader is holding. Shutdown does not send an application goodbye frame.
+- `OnDisconnect` does not run when `OnConnect` fails, panics, or closes the socket itself.

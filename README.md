@@ -43,6 +43,37 @@ func main() {
 
 `origin` identifies this process. It is not a credential. Inbound text and binary frames are read and discarded. The read is what keeps ping, pong, and close working.
 
+## Connections
+
+A connection is registered as soon as the handshake succeeds. `OnConnect` runs before the hello frame, on the connection goroutine. Return an error to reject the socket. A panic in the hook is logged with its stack and also rejects the socket. `OnDisconnect` runs only after `OnConnect` has returned nil and the connection is still open. It does not run for a rejected connect.
+
+```go
+srv.OnConnect(func(ctx context.Context, conn *gorealtime.Connection) error {
+    return conn.SetIdentity("alice")
+})
+srv.OnDisconnect(func(ctx context.Context, conn *gorealtime.Connection, reason string) {
+    log.Printf("closed %s (%s)", conn.ID(), reason)
+})
+```
+
+Identity is an application string, not a user table. Several connections may use the same identity. An empty identity is anonymous and is not indexed. There is no client message that sets identity or metadata; only server-side methods do.
+
+```go
+conn, ok := srv.Connection(id)
+same := srv.ConnectionsByIdentity("alice")
+_ = conn.SetMetadata("locale", "en")
+info := conn.Info()
+conn.Close()
+```
+
+`Metadata` and `Info` return copies. Keys are limited to 64 bytes, values to 256, and 32 keys per connection. Identity is limited to 256 bytes. Control characters are rejected.
+
+`Connection.Close` is idempotent. The first close wins the reason: `client_close`, `server_close`, `shutdown`, `read_error`, `write_error`, or `connect_rejected`. `Context` is canceled when cleanup starts.
+
+Do not call `Shutdown` from a connect or disconnect hook. The hook runs on the connection goroutine, and `Shutdown` waits for it.
+
+Hooks must not assume they can send on the socket. Sending is a later milestone. Hello is the only server frame today.
+
 `Handler` is an `http.Handler` for a router other than `ServeMux`. It does not look at the request path. `RegisterRoutes` is what mounts it at `Path`.
 
 ## Configuration
