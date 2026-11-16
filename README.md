@@ -99,6 +99,22 @@ return gorealtime.WithMessage(gorealtime.ErrUnauthorized, "not a member")
 
 `WithMaxPayloadBytes` sets the payload cap. The default is 32 KiB. The legal range is 1 byte to 8 MiB. The read limit is that value plus 4 KiB.
 
+## Compression
+
+Compression is off by default. `WithCompression` offers `permessage-deflate` when the client asks for it.
+
+```go
+srv := gorealtime.NewServer(
+    gorealtime.WithCompression(gorealtime.CompressionConfig{
+        Enabled: true,
+    }),
+)
+```
+
+`Enabled` is required. `Level` 0 selects `compress/flate.DefaultCompression`. `MinSize` 0 selects 128 bytes; shorter payloads are sent uncompressed. `ServerContextTakeover` and `ClientContextTakeover` default off, which is the setting to keep. `MaxDecompressedBytes` and `MaxCompressedBytes` default to the WebSocket read limit. `Connection.Compression` reports what a given socket agreed. `docs/protocol.md` is the negotiation, and `docs/security.md` is why a frame that mixes a secret with attacker-controlled bytes should not be compressed.
+
+Compression reduces bytes on the wire and spends CPU and a 32 KiB window per direction to do it. It is not a latency win. `docs/performance.md` has one measured run.
+
 ## Sending
 
 `Send` queues one event for one connection. `SendToIdentity` queues it for every connection with that identity. `Broadcast` queues it for every connection. `SendToGroup` queues it for the members of a process-local group. The JSON is encoded once and the same frame is queued to each target. `ExcludeConnections` skips ids.
@@ -190,6 +206,7 @@ A ping is sent every 30s. The pong must arrive within 10s. `WithHeartbeat(interv
 | `WithHeartbeat` | Ping interval and pong timeout. Zero interval disables. Default 30s and 10s. |
 | `WithWriteTimeout` | One outbound frame. Default 10s, maximum 2 minutes. |
 | `WithMetrics` | Optional counters. nil funcs are skipped. |
+| `WithCompression` | Permessage-deflate. Off unless `Enabled` is set. Context takeover defaults off. |
 
 A missing `Origin` is allowed. A present `Origin` must match the request host or a pattern. That stops a browser page on another site from opening the socket. It does not authenticate the caller. Non-browser clients can send any `Origin` they want.
 

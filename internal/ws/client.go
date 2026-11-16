@@ -20,10 +20,27 @@ type Client struct {
 	w *wire
 }
 
+// ClientConfig is the dial policy for the standard-library client.
+// Compression.Enabled offers permessage-deflate. Header is copied onto
+// the handshake. If Header already contains Sec-WebSocket-Extensions,
+// that value is the offer and Compression still decides what this
+// client is willing to do with the response.
+type ClientConfig struct {
+	Header      http.Header
+	Compression Compression
+	// ReadLimit is the maximum inbound message size. Zero selects 8 MiB plus 4 KiB.
+	ReadLimit int64
+}
+
 // Dial opens a WebSocket client connection.
 // rawURL uses the ws or wss scheme. header is copied onto the handshake.
 // On a non-101 response, Client is nil and the HTTP response is returned.
 func Dial(ctx context.Context, rawURL string, header http.Header) (*Client, *http.Response, error) {
+	return DialClient(ctx, rawURL, ClientConfig{Header: header})
+}
+
+// DialClient opens a WebSocket client connection with cfg.
+func DialClient(ctx context.Context, rawURL string, cfg ClientConfig) (*Client, *http.Response, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -62,6 +79,13 @@ func Dial(ctx context.Context, rawURL string, header http.Header) (*Client, *htt
 	if path == "" {
 		path = "/"
 	}
+	header := cfg.Header.Clone()
+	if header == nil {
+		header = make(http.Header)
+	}
+	if cfg.Compression.Enabled && header.Get("Sec-WebSocket-Extensions") == "" {
+		header.Set("Sec-WebSocket-Extensions", clientOffer(cfg.Compression))
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "GET %s HTTP/1.1\r\n", path)
 	fmt.Fprintf(&b, "Host: %s\r\n", u.Host)
@@ -97,13 +121,55 @@ func Dial(ctx context.Context, rawURL string, header http.Header) (*Client, *htt
 		_ = nc.Close()
 		return nil, resp, fmt.Errorf("websocket: bad accept key")
 	}
+	limit := cfg.ReadLimit
+	if limit == 0 {
+		limit = 8<<20 + 4096
+	}
+	comp := cfg.Compression
+	offered := comp.Enabled
+	if !offered && strings.Contains(strings.ToLower(header.Get("Sec-WebSocket-Extensions")), "permessage-deflate") {
+		// The caller wrote the offer. Decode the response with the
+		// caller's compression policy, which defaults to no context takeover.
+		offered = true
+		comp.Enabled = true
+	}
+	var pm *pmce
+	extHeader := resp.Header.Get("Sec-WebSocket-Extensions")
+	if offered {
+		if comp.MaxDecompressed == 0 {
+			comp.MaxDecompressed = limit
+		}
+		if comp.MaxCompressed == 0 {
+			comp.MaxCompressed = limit
+		}
+		var err error
+		pm, err = clientPMCE(extHeader, comp)
+		if err != nil {
+			resp.Body.Close()
+			_ = nc.Close()
+			return nil, resp, err
+		}
+	} else if strings.TrimSpace(extHeader) != "" {
+		resp.Body.Close()
+		_ = nc.Close()
+		return nil, resp, fmt.Errorf("%w: extension was not offered", errProtocol)
+	}
 	resp.Body.Close()
 	return &Client{w: &wire{
 		nc:        nc,
 		br:        br,
 		server:    false,
-		readLimit: 8<<20 + 4096,
+		readLimit: limit,
+		pmce:      pm,
 	}}, resp, nil
+}
+
+// Negotiated reports the permessage-deflate agreement for this client.
+func (c *Client) Negotiated() Negotiated {
+	if c == nil || c.w == nil || c.w.pmce == nil {
+		return Negotiated{}
+	}
+	return c.w.pmce.neg
 }
 
 // Read returns the next data message.

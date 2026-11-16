@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -43,20 +44,28 @@ type wire struct {
 	pongWait chan struct{}
 
 	closeOnce sync.Once
+	shut      atomic.Bool
+	pmce      *pmce
 }
 
 func (w *wire) Read(ctx context.Context) (binary bool, data []byte, err error) {
 	w.readMu.Lock()
-	defer w.readMu.Unlock()
+	defer func() {
+		if w.shut.Load() && w.pmce != nil {
+			w.pmce.releaseIn()
+		}
+		w.readMu.Unlock()
+	}()
 	stop := w.armDeadline(ctx, false)
 	defer stop()
 
 	var (
-		buf   []byte
-		gotOp byte
+		buf        []byte
+		gotOp      byte
+		compressed bool
 	)
 	for {
-		fin, op, payload, err := w.readFrame()
+		fin, op, rsv1, payload, err := w.readFrame()
 		if err != nil {
 			return false, nil, err
 		}
@@ -76,32 +85,47 @@ func (w *wire) Read(ctx context.Context) (binary bool, data []byte, err error) {
 				return false, nil, errProtocol
 			}
 			gotOp = op
+			if rsv1 {
+				compressed = true
+			}
 			buf = append(buf, payload...)
-			if tooBig(buf, w.readLimit) {
+			if w.messageTooBig(len(buf), compressed) {
 				w.CloseNow()
 				return false, nil, errTooBig
 			}
 			if fin {
-				return op == opBinary, buf, nil
+				return w.finishMessage(ctx, gotOp, buf, compressed)
 			}
 		case opCont:
-			if gotOp == 0 {
+			if gotOp == 0 || rsv1 {
 				w.CloseNow()
 				return false, nil, errProtocol
 			}
 			buf = append(buf, payload...)
-			if tooBig(buf, w.readLimit) {
+			if w.messageTooBig(len(buf), compressed) {
 				w.CloseNow()
 				return false, nil, errTooBig
 			}
 			if fin {
-				return gotOp == opBinary, buf, nil
+				return w.finishMessage(ctx, gotOp, buf, compressed)
 			}
 		default:
 			w.CloseNow()
 			return false, nil, errProtocol
 		}
 	}
+}
+
+func (w *wire) finishMessage(ctx context.Context, op byte, buf []byte, compressed bool) (bool, []byte, error) {
+	if compressed {
+		out, err := w.pmce.decompress(ctx, buf)
+		if err != nil {
+			w.CloseNow()
+			return false, nil, err
+		}
+		buf = out
+	}
+	return op == opBinary, buf, nil
 }
 
 func (w *wire) Write(ctx context.Context, p []byte) error {
@@ -113,7 +137,19 @@ func (w *wire) writeMessage(ctx context.Context, binary bool, p []byte) error {
 	if binary {
 		op = opBinary
 	}
-	return w.writeFrame(ctx, op, p)
+	w.writeMu.Lock()
+	defer w.unlockWrite()
+	payload := p
+	rsv1 := false
+	if w.pmce != nil && w.pmce.on {
+		out, compressed, err := w.pmce.compress(p)
+		if err != nil {
+			return err
+		}
+		payload = out
+		rsv1 = compressed
+	}
+	return w.writeFrameLocked(ctx, op, payload, true, rsv1)
 }
 
 func (w *wire) Ping(ctx context.Context) error {
@@ -154,9 +190,25 @@ func (w *wire) CloseNow() error {
 	if w == nil || w.nc == nil {
 		return nil
 	}
+	w.shut.Store(true)
 	w.closeOnce.Do(func() {
 		_ = w.nc.Close()
 	})
+	// Read or Write may hold these locks. TryLock drops the flate windows
+	// when the caller is outside those calls. The in-call path drops them
+	// on the way out, after it notices shut.
+	if w.readMu.TryLock() {
+		if w.pmce != nil {
+			w.pmce.releaseIn()
+		}
+		w.readMu.Unlock()
+	}
+	if w.writeMu.TryLock() {
+		if w.pmce != nil {
+			w.pmce.releaseOut()
+		}
+		w.writeMu.Unlock()
+	}
 	return nil
 }
 
@@ -170,75 +222,97 @@ func (w *wire) notePong() {
 	}
 }
 
-func (w *wire) readFrame() (fin bool, op byte, payload []byte, err error) {
+func (w *wire) readFrame() (fin bool, op byte, rsv1 bool, payload []byte, err error) {
 	var hdr [2]byte
 	if _, err = io.ReadFull(w.br, hdr[:]); err != nil {
-		return false, 0, nil, err
+		return false, 0, false, nil, err
 	}
 	fin = hdr[0]&0x80 != 0
-	if hdr[0]&0x70 != 0 {
-		w.CloseNow()
-		return false, 0, nil, errProtocol
-	}
+	rsv1 = hdr[0]&0x40 != 0
 	op = hdr[0] & 0x0f
+	// RSV2 and RSV3 are unused. RSV1 is the permessage-deflate bit and
+	// is legal only on the first frame of a data message after negotiation.
+	if hdr[0]&0x30 != 0 || (rsv1 && (op&0x8 != 0 || op == opCont || w.pmce == nil || !w.pmce.on)) {
+		w.CloseNow()
+		return false, 0, false, nil, errProtocol
+	}
 	masked := hdr[1]&0x80 != 0
 	if w.server != masked {
 		w.CloseNow()
-		return false, 0, nil, errProtocol
+		return false, 0, false, nil, errProtocol
 	}
 	n := int64(hdr[1] & 0x7f)
 	switch n {
 	case 126:
 		var ext [2]byte
 		if _, err = io.ReadFull(w.br, ext[:]); err != nil {
-			return false, 0, nil, err
+			return false, 0, false, nil, err
 		}
 		n = int64(binary.BigEndian.Uint16(ext[:]))
 	case 127:
 		var ext [8]byte
 		if _, err = io.ReadFull(w.br, ext[:]); err != nil {
-			return false, 0, nil, err
+			return false, 0, false, nil, err
 		}
 		u := binary.BigEndian.Uint64(ext[:])
 		if u > 1<<62 {
 			w.CloseNow()
-			return false, 0, nil, errProtocol
+			return false, 0, false, nil, errProtocol
 		}
 		n = int64(u)
 	}
-	if n > w.readLimit {
+	if n > w.readLimit || (rsv1 && w.pmce != nil && w.pmce.maxIn > 0 && n > w.pmce.maxIn) {
 		w.CloseNow()
-		return false, 0, nil, errTooBig
+		return false, 0, false, nil, errTooBig
 	}
 	control := op&0x8 != 0
 	if control && (!fin || n > 125) {
 		w.CloseNow()
-		return false, 0, nil, errProtocol
+		return false, 0, false, nil, errProtocol
 	}
 	var key [4]byte
 	if masked {
 		if _, err = io.ReadFull(w.br, key[:]); err != nil {
-			return false, 0, nil, err
+			return false, 0, false, nil, err
 		}
 	}
 	payload = make([]byte, n)
 	if _, err = io.ReadFull(w.br, payload); err != nil {
-		return false, 0, nil, err
+		return false, 0, false, nil, err
 	}
 	if masked {
 		for i := range payload {
 			payload[i] ^= key[i%4]
 		}
 	}
-	return fin, op, payload, nil
+	return fin, op, rsv1, payload, nil
 }
 
 func (w *wire) writeFrame(ctx context.Context, op byte, payload []byte) error {
+	w.writeMu.Lock()
+	defer w.unlockWrite()
+	return w.writeFrameLocked(ctx, op, payload, true, false)
+}
+
+func (w *wire) unlockWrite() {
+	if w.shut.Load() && w.pmce != nil {
+		w.pmce.releaseOut()
+	}
+	w.writeMu.Unlock()
+}
+
+// writeFrameFlags sends one frame without compressing it.
+// Tests use it to build fragmented and RSV1 frames directly.
+func (w *wire) writeFrameFlags(ctx context.Context, fin bool, op byte, rsv1 bool, payload []byte) error {
+	w.writeMu.Lock()
+	defer w.unlockWrite()
+	return w.writeFrameLocked(ctx, op, payload, fin, rsv1)
+}
+
+func (w *wire) writeFrameLocked(ctx context.Context, op byte, payload []byte, fin, rsv1 bool) error {
 	if payload == nil {
 		payload = []byte{}
 	}
-	w.writeMu.Lock()
-	defer w.writeMu.Unlock()
 	stop := w.armDeadline(ctx, true)
 	defer stop()
 
@@ -255,7 +329,13 @@ func (w *wire) writeFrame(ctx context.Context, op byte, payload []byte) error {
 		hdrLen += 4
 	}
 	buf := make([]byte, hdrLen+n)
-	buf[0] = 0x80 | op
+	if fin {
+		buf[0] |= 0x80
+	}
+	if rsv1 {
+		buf[0] |= 0x40
+	}
+	buf[0] |= op
 	switch {
 	case n > 65535:
 		buf[1] = 127
@@ -312,8 +392,11 @@ func (w *wire) armDeadline(ctx context.Context, write bool) func() {
 	}
 }
 
-func tooBig(b []byte, limit int64) bool {
-	return int64(len(b)) > limit
+func (w *wire) messageTooBig(n int, compressed bool) bool {
+	if int64(n) > w.readLimit {
+		return true
+	}
+	return compressed && w.pmce != nil && w.pmce.maxIn > 0 && int64(n) > w.pmce.maxIn
 }
 
 func closeError(payload []byte) error {

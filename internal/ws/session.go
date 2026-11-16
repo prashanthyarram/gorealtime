@@ -54,6 +54,9 @@ type Config struct {
 	InsecureSkipOrigin bool
 	// ReadLimit is the maximum inbound message size. Zero selects DefaultReadLimit.
 	ReadLimit int64
+	// Compression negotiates permessage-deflate when Enabled is set.
+	// The zero value does not advertise the extension.
+	Compression Compression
 }
 
 // Session is one accepted WebSocket.
@@ -81,6 +84,19 @@ func Upgrade(w http.ResponseWriter, r *http.Request, cfg Config) (*Session, erro
 		http.Error(w, "bad websocket handshake", http.StatusBadRequest)
 		return nil, err
 	}
+	ext, pm, err := negotiate(r.Header.Values("Sec-WebSocket-Extensions"), cfg.Compression)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return nil, err
+	}
+	accepted := false
+	defer func() {
+		if accepted || pm == nil {
+			return
+		}
+		pm.releaseIn()
+		pm.releaseOut()
+	}()
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -92,7 +108,7 @@ func Upgrade(w http.ResponseWriter, r *http.Request, cfg Config) (*Session, erro
 		return nil, err
 	}
 	key := r.Header.Get("Sec-WebSocket-Key")
-	if err := writeAccept(rw.Writer, key); err != nil {
+	if err := writeAccept(rw.Writer, key, ext); err != nil {
 		_ = nc.Close()
 		return nil, err
 	}
@@ -100,12 +116,23 @@ func Upgrade(w http.ResponseWriter, r *http.Request, cfg Config) (*Session, erro
 	if rw.Reader == nil {
 		br = bufio.NewReader(nc)
 	}
+	accepted = true
 	return &Session{w: &wire{
 		nc:        nc,
 		br:        br,
 		server:    true,
 		readLimit: limit,
+		pmce:      pm,
 	}}, nil
+}
+
+// Negotiated reports the permessage-deflate agreement for this session.
+// The zero value means the peer did not negotiate compression.
+func (s *Session) Negotiated() Negotiated {
+	if s == nil || s.w == nil || s.w.pmce == nil {
+		return Negotiated{}
+	}
+	return s.w.pmce.neg
 }
 
 // Read returns the next data message.
@@ -231,20 +258,30 @@ func acceptValue(key string) string {
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
-func writeAccept(w io.Writer, key string) error {
+func writeAccept(w io.Writer, key, extensions string) error {
 	if bw, ok := w.(*bufio.Writer); ok {
-		if _, err := io.WriteString(bw, acceptResponse(key)); err != nil {
+		if _, err := io.WriteString(bw, acceptResponse(key, extensions)); err != nil {
 			return err
 		}
 		return bw.Flush()
 	}
-	_, err := io.WriteString(w, acceptResponse(key))
+	_, err := io.WriteString(w, acceptResponse(key, extensions))
 	return err
 }
 
-func acceptResponse(key string) string {
-	return "HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + acceptValue(key) + "\r\n\r\n"
+func acceptResponse(key, extensions string) string {
+	var b strings.Builder
+	b.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+	b.WriteString("Upgrade: websocket\r\n")
+	b.WriteString("Connection: Upgrade\r\n")
+	b.WriteString("Sec-WebSocket-Accept: ")
+	b.WriteString(acceptValue(key))
+	b.WriteString("\r\n")
+	if extensions != "" {
+		b.WriteString("Sec-WebSocket-Extensions: ")
+		b.WriteString(extensions)
+		b.WriteString("\r\n")
+	}
+	b.WriteString("\r\n")
+	return b.String()
 }
