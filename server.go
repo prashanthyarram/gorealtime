@@ -266,9 +266,8 @@ func (s *Server) runConnection(c *Connection) {
 	// Heartbeats start only once Read is the caller, so the pong has a reader.
 	c.enableHeartbeat()
 
-	// context.Background is intentional. coder/websocket treats cancellation
-	// of the read context as a failed read and closes the socket, so a read
-	// deadline cannot be expressed that way. CloseNow unblocks this call.
+	// context.Background is intentional. Ending the context passed to Read
+	// fails that read. CloseNow unblocks it by closing the socket.
 	// Handlers run inline on this goroutine, one event at a time.
 	for {
 		binary, data, err := c.sess.Read(context.Background())

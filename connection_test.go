@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/websocket"
+	"github.com/prashanthyarram/gorealtime/internal/ws"
 )
 
 func TestConnectHookSetsIdentity(t *testing.T) {
@@ -72,7 +72,7 @@ func TestConnectHookSetsIdentity(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := a.Write(ctx, websocket.MessageText, []byte(`{"n":1}`)); err != nil {
+	if err := a.Write(ctx, ws.MessageText, []byte(`{"n":1}`)); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(time.Second)
@@ -124,7 +124,7 @@ func TestIdentityMoveAndCloseOneOfMany(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := a.Close(websocket.StatusNormalClosure, ""); err != nil {
+	if err := a.Close(ws.StatusNormalClosure, ""); err != nil {
 		t.Fatal(err)
 	}
 	waitCount(t, s, 1)
@@ -378,7 +378,7 @@ func TestSecretsStayOutOfLogs(t *testing.T) {
 	_ = readHello(t, c)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := c.Write(ctx, websocket.MessageText, []byte(payload)); err != nil {
+	if err := c.Write(ctx, ws.MessageText, []byte(payload)); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(time.Second)

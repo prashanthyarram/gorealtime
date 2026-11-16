@@ -10,7 +10,7 @@ It does not implement a chat product. It does not store messages, users, or memb
 go get github.com/prashanthyarram/gorealtime
 ```
 
-The module requires Go 1.22. The WebSocket implementation is `github.com/coder/websocket` v1.8.13. The reason for that pin is in `docs/architecture.md`.
+The module requires Go 1.22 and has no external dependencies. WebSocket framing is implemented with the standard library. See `docs/architecture.md`.
 
 ## Server
 

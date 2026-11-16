@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/websocket"
+	"github.com/prashanthyarram/gorealtime/internal/ws"
 )
 
 func TestHelloAndDistinctIDs(t *testing.T) {
@@ -122,7 +122,7 @@ func TestInboundFrameIsIgnoredAndNotLogged(t *testing.T) {
 	const secret = "super-secret-payload-token"
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := c.Write(ctx, websocket.MessageText, []byte(secret)); err != nil {
+	if err := c.Write(ctx, ws.MessageText, []byte(secret)); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(time.Second)
@@ -152,7 +152,7 @@ func TestClientCloseRemovesConnection(t *testing.T) {
 
 	c := dial(t, ts.URL, s.Path(), nil)
 	_ = readHello(t, c)
-	if err := c.Close(websocket.StatusNormalClosure, ""); err != nil {
+	if err := c.Close(ws.StatusNormalClosure, ""); err != nil {
 		t.Fatal(err)
 	}
 	waitCount(t, s, 0)
@@ -288,7 +288,7 @@ func TestConcurrentAcceptAndShutdown(t *testing.T) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			c, _, err := websocket.Dial(ctx, wsURL(ts.URL, s.Path()), nil)
+			c, _, err := ws.Dial(ctx, wsURL(ts.URL, s.Path()), nil)
 			if err != nil {
 				return
 			}
@@ -328,11 +328,11 @@ type helloWire struct {
 	} `json:"payload"`
 }
 
-func dial(t *testing.T, base, pth string, header http.Header) *websocket.Conn {
+func dial(t *testing.T, base, pth string, header http.Header) *ws.Client {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	t.Cleanup(cancel)
-	c, _, err := websocket.Dial(ctx, wsURL(base, pth), &websocket.DialOptions{HTTPHeader: header})
+	c, _, err := ws.Dial(ctx, wsURL(base, pth), header)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -343,9 +343,7 @@ func assertDialStatus(t *testing.T, ts *httptest.Server, pth, origin string, sta
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_, resp, err := websocket.Dial(ctx, wsURL(ts.URL, pth), &websocket.DialOptions{
-		HTTPHeader: http.Header{"Origin": []string{origin}},
-	})
+	_, resp, err := ws.Dial(ctx, wsURL(ts.URL, pth), http.Header{"Origin": []string{origin}})
 	if err == nil {
 		t.Fatal("expected dial error")
 	}
@@ -357,7 +355,7 @@ func assertDialStatus(t *testing.T, ts *httptest.Server, pth, origin string, sta
 	}
 }
 
-func readHello(t *testing.T, c *websocket.Conn) helloWire {
+func readHello(t *testing.T, c *ws.Client) helloWire {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -365,7 +363,7 @@ func readHello(t *testing.T, c *websocket.Conn) helloWire {
 	if err != nil {
 		t.Fatalf("read hello: %v", err)
 	}
-	if typ != websocket.MessageText {
+	if typ != ws.MessageText {
 		t.Fatalf("type %v", typ)
 	}
 	var h helloWire

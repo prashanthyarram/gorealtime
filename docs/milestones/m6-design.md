@@ -4,7 +4,7 @@
 
 Measure the local path and write the numbers down. Do not change locking, allocation, or goroutine use unless a run shows a concrete cost, and then measure that change again.
 
-Benchmarks use an in-memory session whose `Write` appends the frame. They do not include a TCP round trip or `coder/websocket` framing. That keeps the sample on registry, JSON, queue, and fan-out. A separate stress test dials real sockets through `httptest` so disconnect still joins the network stack and the transport's goroutines.
+Benchmarks use an in-memory session whose `Write` appends the frame. They do not include a TCP round trip or WebSocket framing. That keeps the sample on registry, JSON, queue, and fan-out. A separate stress test dials real sockets through `httptest` so disconnect still joins the network stack and the transport's goroutines.
 
 Heartbeats are off in these runs. A ping timer would make a short benchmark look uneven.
 

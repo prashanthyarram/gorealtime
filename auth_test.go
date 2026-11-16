@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/websocket"
+	"github.com/prashanthyarram/gorealtime/internal/ws"
 )
 
 func TestRequireAuthRejectsBeforeUpgrade(t *testing.T) {
@@ -106,7 +106,7 @@ func TestEventAndGroupAuthorizers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	body := `{"v":1,"type":"event","event":"ping","id":"e1"}`
-	if err := c.Write(ctx, websocket.MessageText, []byte(body)); err != nil {
+	if err := c.Write(ctx, ws.MessageText, []byte(body)); err != nil {
 		t.Fatal(err)
 	}
 	_, data, err := c.Read(ctx)
@@ -245,7 +245,7 @@ func TestMetricsHooks(t *testing.T) {
 	_ = readHello(t, c)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := c.Write(ctx, websocket.MessageText, []byte(`{"v":1,"type":"event","event":"ping"}`)); err != nil {
+	if err := c.Write(ctx, ws.MessageText, []byte(`{"v":1,"type":"event","event":"ping"}`)); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -259,9 +259,7 @@ func assertDialHeaderStatus(t *testing.T, ts *httptest.Server, pth, auth string,
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_, resp, err := websocket.Dial(ctx, wsURL(ts.URL, pth), &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": []string{auth}},
-	})
+	_, resp, err := ws.Dial(ctx, wsURL(ts.URL, pth), http.Header{"Authorization": []string{auth}})
 	if err == nil {
 		t.Fatal("expected dial error")
 	}
