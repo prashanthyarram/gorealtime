@@ -16,14 +16,20 @@ import (
 const maxPendingTickets = 4096
 
 // TransportDescription is one transport a client may try, in preference order.
+// Extensions lists WebSocket extensions this process can negotiate.
+// It is empty for server-sent events and long polling. Those transports
+// do not use permessage-deflate. HTTP content coding, when the client
+// asks for it, is a property of that HTTP response, not of this list.
 type TransportDescription struct {
 	Name            string   `json:"name"`
 	TransferFormats []string `json:"transferFormats"`
+	Extensions      []string `json:"extensions,omitempty"`
 }
 
 // Negotiation is the body of a successful negotiate response.
-// ConnectionToken is a short-lived credential for one connection. It is
-// not an application login. Send it in X-Gorealtime-Connection-Token.
+// ConnectionToken is a short-lived transport ticket for one connection.
+// It is not an application login, and the library does not issue, refresh,
+// or store user credentials. Send it in X-Gorealtime-Connection-Token.
 // Do not put it in a URL.
 type Negotiation struct {
 	ProtocolVersion     int                    `json:"protocolVersion"`
@@ -31,7 +37,6 @@ type Negotiation struct {
 	ConnectionToken     string                 `json:"connectionToken"`
 	ExpiresAt           time.Time              `json:"expiresAt"`
 	AvailableTransports []TransportDescription `json:"availableTransports"`
-	Capabilities        []string               `json:"capabilities,omitempty"`
 }
 
 type ticket struct {
@@ -230,9 +235,6 @@ func (s *Server) serveNegotiate(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:           tk.expires.UTC(),
 		AvailableTransports: s.offeredTransports(),
 	}
-	if s.opts.compression.enabled {
-		body.Capabilities = []string{"permessage-deflate"}
-	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
@@ -248,10 +250,14 @@ func (s *Server) offeredTransports() []TransportDescription {
 		if !s.opts.transportEnabled(name) {
 			continue
 		}
-		out = append(out, TransportDescription{
+		item := TransportDescription{
 			Name:            name,
 			TransferFormats: []string{"Text"},
-		})
+		}
+		if name == TransportWebSocket && s.opts.compression.enabled {
+			item.Extensions = []string{"permessage-deflate"}
+		}
+		out = append(out, item)
 	}
 	return out
 }

@@ -3,6 +3,7 @@ package gorealtime
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -45,8 +46,11 @@ func TestNegotiateAndShouldFallback(t *testing.T) {
 	if neg.AvailableTransports[0].Name != TransportWebSocket || neg.AvailableTransports[1].Name != TransportSSE || neg.AvailableTransports[2].Name != TransportLongPolling {
 		t.Fatalf("order %+v", neg.AvailableTransports)
 	}
-	if len(neg.Capabilities) != 1 || neg.Capabilities[0] != "permessage-deflate" {
-		t.Fatalf("capabilities %+v", neg.Capabilities)
+	if len(neg.AvailableTransports[0].Extensions) != 1 || neg.AvailableTransports[0].Extensions[0] != "permessage-deflate" {
+		t.Fatalf("websocket extensions %+v", neg.AvailableTransports[0])
+	}
+	if len(neg.AvailableTransports[1].Extensions) != 0 || len(neg.AvailableTransports[2].Extensions) != 0 {
+		t.Fatalf("non-websocket extensions %+v", neg.AvailableTransports)
 	}
 	if ShouldFallback(http.StatusUnauthorized) || ShouldFallback(http.StatusForbidden) || ShouldFallback(http.StatusConflict) || ShouldFallback(http.StatusServiceUnavailable) {
 		t.Fatal("policy statuses must not fall back")
@@ -62,6 +66,55 @@ func TestNegotiateAndShouldFallback(t *testing.T) {
 	bad.Body.Close()
 	if bad.StatusCode != http.StatusBadRequest || ShouldFallback(bad.StatusCode) {
 		t.Fatalf("malformed %d", bad.StatusCode)
+	}
+}
+
+func TestHTTPGzipIsNotWebSocketCompression(t *testing.T) {
+	if acceptsGzip("") || acceptsGzip("gzip;q=0") || acceptsGzip("identity") {
+		t.Fatal("gzip should stay off")
+	}
+	if !acceptsGzip("gzip") || !acceptsGzip("identity;q=0, gzip;q=0.5") || !acceptsGzip("*") {
+		t.Fatal("gzip should be accepted")
+	}
+
+	s := NewServer(WithCompression(CompressionConfig{Enabled: true}))
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+	defer shutdown(t, s)
+
+	neg := negotiate(t, ts.URL)
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/poll", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(connectionTokenHeader, neg.ConnectionToken)
+	req.Header.Set("Accept-Encoding", "gzip")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.Header.Get("Content-Encoding") != "gzip" {
+		t.Fatalf("encoding %q", res.Header.Get("Content-Encoding"))
+	}
+	zr, err := gzip.NewReader(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	body, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), neg.ConnectionID) {
+		t.Fatalf("body %s", body)
+	}
+	conn, ok := s.Connection(neg.ConnectionID)
+	if !ok {
+		t.Fatal("missing connection")
+	}
+	if got := conn.Compression(); got.Negotiated || got.Extension != "" || got.Level != 0 {
+		t.Fatalf("long-poll compression = %+v", got)
 	}
 }
 

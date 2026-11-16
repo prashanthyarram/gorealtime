@@ -2,9 +2,10 @@
 //
 // The application owns authentication, authorization, and storage. This package
 // owns connection lifecycle, event transport, dispatch, connection routing, and
-// local groups. It does not speak the SignalR protocol and it does not persist
-// messages. Delivery is at-most-once within one process: a queued frame is not
-// a delivered frame, and nothing is replayed after a reconnect.
+// local groups. It does not speak the SignalR protocol. It does not issue
+// application credentials, and it does not persist or replay events. Delivery
+// is at-most-once within one process: a queued frame is not a delivered frame,
+// and nothing is replayed after a reconnect.
 //
 // WebSocket is the primary transport. Server-sent events and long polling are
 // fallbacks negotiated at POST <path>/negotiate. Those two are not full-duplex

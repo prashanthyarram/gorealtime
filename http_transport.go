@@ -259,13 +259,20 @@ func (s *Server) serveSSE(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	tk.sess.attach(w, flusher)
+	out := http.ResponseWriter(w)
+	flush := flusher
+	if gz, gzFlush, closeGzip, ok := wrapGzip(w, r); ok {
+		out = gz
+		flush = gzFlush
+		defer closeGzip()
+	}
+	tk.sess.attach(out, flush)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
+	flush.Flush()
 	if !s.launch(tk.conn, tk.identity, tk.meta) {
 		s.tickets.drop(tk.token)
 		return
@@ -349,7 +356,9 @@ func (s *Server) servePoll(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	_ = json.NewEncoder(w).Encode(struct {
+	dst, closeBody, _ := gzipWriter(w, r)
+	defer closeBody()
+	_ = json.NewEncoder(dst).Encode(struct {
 		Messages []json.RawMessage `json:"messages"`
 	}{Messages: msgs})
 }

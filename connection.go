@@ -179,11 +179,15 @@ type CompressionStatus struct {
 	MaxCompressedBytes    int
 }
 
-// Compression returns the agreement for this connection.
-// A connection whose transport does not report negotiation returns
-// the server policy with Negotiated false.
+// Compression returns the WebSocket permessage-deflate agreement.
+// Server-sent events and long polling return a zero status. HTTP content
+// coding on those responses is not permessage-deflate, and this method
+// does not report it.
 func (c *Connection) Compression() CompressionStatus {
 	if c == nil || c.server == nil {
+		return CompressionStatus{}
+	}
+	if c.transport != "" && c.transport != TransportWebSocket {
 		return CompressionStatus{}
 	}
 	cfg := c.server.opts.compression
