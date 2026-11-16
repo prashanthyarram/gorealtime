@@ -131,3 +131,14 @@ Context takeover on the echo also retains the window: about 182 KiB and 23 alloc
 
 A 4-byte payload with the minimum size forced to 1 costs about 32 µs for an echo. Compressing 16 repeated bytes, without the socket, is about 11 µs. The default minimum of 128 bytes skips that path. The skip itself is about 1.5 ns and allocates nothing.
 
+## SSE and long poll
+
+`go test -bench=. -count=1 ./...` on the same class of machine, one sample:
+
+```text
+BenchmarkSSEDeliver-4         18905086    62.35 ns/op     32 B/op    4 allocs/op
+BenchmarkLongPollDeliver-4     7635668   155.7 ns/op     125 B/op    1 allocs/op
+```
+
+`BenchmarkSSEDeliver` writes one JSON envelope into a discarding `http.ResponseWriter`. `BenchmarkLongPollDeliver` writes one envelope into the poll buffer while another goroutine drains it. Neither number includes TCP, TLS, or a browser. A full connection still pays the queue, the write goroutine, and the HTTP request.
+

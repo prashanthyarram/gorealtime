@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -30,6 +31,14 @@ type ClientConfig struct {
 	Compression Compression
 	// ReadLimit is the maximum inbound message size. Zero selects 8 MiB plus 4 KiB.
 	ReadLimit int64
+	// TLS is the configuration for wss. Nil uses the default verifier and
+	// TLS 1.2 or newer. Certificate verification stays on unless the caller
+	// sets InsecureSkipVerify on the config they pass. This client never
+	// turns verification off by itself.
+	TLS *tls.Config
+	// HandshakeTimeout bounds the upgrade when ctx has no deadline.
+	// Zero means only ctx's deadline applies.
+	HandshakeTimeout time.Duration
 }
 
 // Dial opens a WebSocket client connection.
@@ -48,25 +57,34 @@ func DialClient(ctx context.Context, rawURL string, cfg ClientConfig) (*Client, 
 	if err != nil {
 		return nil, nil, err
 	}
-	network := "tcp"
 	switch u.Scheme {
-	case "ws":
-	case "wss":
-		return nil, nil, fmt.Errorf("websocket: wss is not dialed by this client")
+	case "ws", "wss":
 	default:
 		return nil, nil, fmt.Errorf("websocket: unsupported scheme %q", u.Scheme)
 	}
 	host := u.Host
 	if !strings.Contains(host, ":") {
-		host += ":80"
+		if u.Scheme == "wss" {
+			host += ":443"
+		} else {
+			host += ":80"
+		}
 	}
 	var d net.Dialer
-	nc, err := d.DialContext(ctx, network, host)
+	var nc net.Conn
+	if u.Scheme == "wss" {
+		td := tls.Dialer{NetDialer: &d, Config: clientTLS(cfg.TLS, u.Hostname())}
+		nc, err = td.DialContext(ctx, "tcp", host)
+	} else {
+		nc, err = d.DialContext(ctx, "tcp", host)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = nc.SetDeadline(deadline)
+	} else if cfg.HandshakeTimeout > 0 {
+		_ = nc.SetDeadline(time.Now().Add(cfg.HandshakeTimeout))
 	}
 	defer nc.SetDeadline(time.Time{})
 	keyRaw := make([]byte, 16)
@@ -201,6 +219,22 @@ func (c *Client) Close(code int, reason string) error {
 		return errClosed
 	}
 	return c.w.Close(code, reason)
+}
+
+func clientTLS(in *tls.Config, serverName string) *tls.Config {
+	var out *tls.Config
+	if in == nil {
+		out = &tls.Config{MinVersion: tls.VersionTLS12}
+	} else {
+		out = in.Clone()
+		if out.MinVersion == 0 {
+			out.MinVersion = tls.VersionTLS12
+		}
+	}
+	if out.ServerName == "" {
+		out.ServerName = serverName
+	}
+	return out
 }
 
 // CloseNow aborts the TCP connection.

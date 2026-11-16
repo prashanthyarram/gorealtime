@@ -17,6 +17,13 @@ type Metrics struct {
 	SlowConsumer      func()
 	AuthFailed        func()
 	WriteFailed       func()
+	// TransportSelected receives TransportWebSocket, TransportSSE, or
+	// TransportLongPolling. It does not receive the connection id.
+	TransportSelected func(name string)
+	// ProtocolError counts a rejected frame or a malformed negotiation body.
+	ProtocolError func()
+	// HeartbeatTimeout counts a connection closed because a heartbeat was missed.
+	HeartbeatTimeout func()
 }
 
 func (s *Server) emit(fn func()) {
@@ -104,4 +111,25 @@ func (s *Server) noteWriteFailed() {
 		return
 	}
 	s.emit(s.opts.metrics.WriteFailed)
+}
+
+func (s *Server) noteTransport(name string) {
+	if s.opts.metrics == nil || s.opts.metrics.TransportSelected == nil {
+		return
+	}
+	s.emit(func() { s.opts.metrics.TransportSelected(name) })
+}
+
+func (s *Server) noteProtocolError() {
+	if s.opts.metrics == nil || s.opts.metrics.ProtocolError == nil {
+		return
+	}
+	s.emit(s.opts.metrics.ProtocolError)
+}
+
+func (s *Server) noteHeartbeat() {
+	if s.opts.metrics == nil || s.opts.metrics.HeartbeatTimeout == nil {
+		return
+	}
+	s.emit(s.opts.metrics.HeartbeatTimeout)
 }

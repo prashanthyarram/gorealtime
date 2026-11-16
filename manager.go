@@ -9,6 +9,7 @@ import "sync"
 type registry struct {
 	mu        sync.Mutex
 	accepting bool
+	maxConns  int
 	byID      map[string]*Connection
 	byIdent   map[string]map[string]*Connection
 }
@@ -23,26 +24,33 @@ func newRegistry() registry {
 
 // tryAdd inserts c if the server is still accepting and the id is free.
 func (r *registry) tryAdd(c *Connection) bool {
-	return r.insert(c, nil)
+	ok, _ := r.insert(c, nil)
+	return ok
 }
 
 // insert registers c. track runs under the registry lock only after c is
 // visible, so Shutdown's Wait cannot observe zero goroutines for a
 // connection that was already published.
-func (r *registry) insert(c *Connection, track func()) bool {
+// The bool full is true when the connection was refused because maxConns
+// was already reached. A false ok with full false means the server is
+// closed or the id is already registered.
+func (r *registry) insert(c *Connection, track func()) (ok bool, full bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.accepting {
-		return false
+		return false, false
+	}
+	if r.maxConns > 0 && len(r.byID) >= r.maxConns {
+		return false, true
 	}
 	if _, exists := r.byID[c.id]; exists {
-		return false
+		return false, false
 	}
 	r.byID[c.id] = c
 	if track != nil {
 		track()
 	}
-	return true
+	return true, false
 }
 
 // remove drops c. It returns false if c was not the registered connection.

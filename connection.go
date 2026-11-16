@@ -64,6 +64,7 @@ type Info struct {
 	ID               string
 	Identity         string
 	RemoteAddr       string
+	Transport        string
 	Metadata         map[string]string
 	ConnectedAt      time.Time
 	LastReadAt       time.Time
@@ -96,6 +97,8 @@ type DisconnectHandler func(ctx context.Context, conn *Connection, reason string
 type Connection struct {
 	id          string
 	remoteAddr  string
+	transport   string
+	accessToken string
 	sess        session
 	server      *Server
 	connectedAt time.Time
@@ -145,6 +148,15 @@ func newConnection(id, remote string, sess session, server *Server) *Connection 
 
 // ID is the process-local connection id. It does not change.
 func (c *Connection) ID() string { return c.id }
+
+// Transport is the name of the transport that carries this connection.
+// It is one of TransportWebSocket, TransportSSE, or TransportLongPolling.
+func (c *Connection) Transport() string {
+	if c == nil {
+		return ""
+	}
+	return c.transport
+}
 
 // CompressionStatus is the compression agreement for one connection.
 // Negotiated is false when this peer did not agree on permessage-deflate.
@@ -282,6 +294,7 @@ func (c *Connection) Info() Info {
 		ID:               c.id,
 		Identity:         c.identity,
 		RemoteAddr:       c.remoteAddr,
+		Transport:        c.transport,
 		Metadata:         copyMeta(c.meta),
 		QueueLen:         qlen,
 		Groups:           groups,
@@ -516,6 +529,7 @@ func (c *Connection) writeLoop() {
 			if err != nil {
 				if c.server != nil {
 					c.server.noteWriteFailed()
+					c.server.noteHeartbeat()
 				}
 				c.signalClose(ReasonHeartbeat)
 				return
@@ -614,6 +628,7 @@ func (c *Connection) finish(reason string) {
 		if c.server != nil {
 			_ = c.server.reg.remove(c)
 			c.server.groups.drop(c)
+			c.server.tickets.drop(c.accessToken)
 			c.server.opts.log.Info("connection.close", "id", c.id, "reason", reason)
 			c.server.noteClosed(reason)
 			if established {

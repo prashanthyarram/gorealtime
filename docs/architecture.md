@@ -6,7 +6,7 @@ This document records decisions that are expensive to reverse. Milestone notes u
 
 ## Transport
 
-WebSocket is the only transport in this release. The handshake and frames live in `internal/ws` and use only the standard library (`net`, `crypto/sha1`, `bufio`, `net/http`). The root package does not re-export those types. Public APIs take `net/http` values and return this module's types.
+WebSocket is the primary transport. The handshake and frames live in `internal/ws` and use only the standard library (`net`, `crypto/sha1`, `crypto/tls`, `bufio`, `net/http`). The root package does not re-export those types. Public APIs take `net/http` values and return this module's types. The dialer accepts `ws://` and `wss://`. `wss` uses `crypto/tls` and verifies the certificate unless the caller passes a `tls.Config` that sets `InsecureSkipVerify`. The library never sets that flag itself.
 
 `github.com/coder/websocket` v1.8.13 was the earlier choice. It is a maintained fork of `nhooyr.io/websocket`, and v1.8.13 was the newest release that compiled on Go 1.22. It was removed so this module has no external dependencies. `golang.org/x/net/websocket` is deprecated and is still a module outside the standard library. `gorilla/websocket` and `gobwas/ws` are external too. The library therefore implements the RFC 6455 subset it needs: the opening handshake, masked client frames, unmasked server frames, text and binary messages, ping/pong, close, a read-size limit, and the origin check.
 
@@ -14,7 +14,7 @@ Concurrency follows the same shape as before. `Read` must not run concurrently w
 
 Permessage-deflate (RFC 7692) is optional and off unless `WithCompression` enables it. Negotiation lives next to the handshake. Each connection owns its own `compress/flate` writer and reader; the writer is used only under the write lock and the reader only under the read lock. RSV1 marks a compressed data message. Control frames are never compressed. The only window this process can use is 32,768 bytes, which is what `compress/flate` implements. An offer that requires `server_max_window_bits` below 15 is declined. Context takeover is off unless the application sets it, and a client's `server_no_context_takeover` is honored. `docs/protocol.md` and `docs/security.md` record the parameters and the CRIME/BREACH boundary.
 
-There is no second transport. SSE, HTTP streaming, and long polling would implement the same session operations later: read a frame, write a frame, probe liveness, and abort. They are not implemented.
+SSE and long polling use the same connection, queue, and event dispatch as a socket. They are not full-duplex. The server writes `text/event-stream` or a poll response. The client posts one envelope to `/send`. Negotiation is `POST /realtime/negotiate` and returns a short-lived connection token. That token is sent in `X-Gorealtime-Connection-Token`. It is not a user credential and it must not be placed in a URL. A direct WebSocket upgrade does not require negotiation. `ShouldFallback` tells a future client which HTTP statuses are transport failures. 401, 403, 409, and 503 are not.
 
 ## Dependencies
 
@@ -75,5 +75,7 @@ Delivery is not durable. A frame that has not been written is dropped when the s
 - A queued frame is not a delivered frame. Nothing is replayed after a reconnect. Shutdown does not flush the queue.
 - Outbound messages are one WebSocket frame. Inbound compressed messages may be fragmented; RSV1 is honored only on the first frame, and the concatenated payload is inflated once.
 - `server_max_window_bits` below 15 is not offered and is not accepted. `client_max_window_bits` is not written on the response. The inflater always keeps a 32,768-byte window, including when context takeover is off, because that is the size `compress/flate` allocates.
-- The standard-library client still does not dial `wss`. TLS remains the caller's `http.Server` or the proxy in front of it.
+- The standard-library client dials `wss` and verifies certificates by default. The production server is still an `http.Handler`. TLS for the listening socket remains the caller's `http.Server` or the proxy in front of it.
+- SSE and long polling share one connection token. A second stream or a second in-flight poll for that token is HTTP 409. Native `EventSource` cannot set the token header; a browser SDK should stream with `fetch`.
+- Group membership is not a client protocol message. The application calls `Join`. There is no cross-process backplane.
 - Compression does not look at event names. A secret and attacker-controlled bytes in the same frame are compressed together when compression is on. Turn it off for those sockets.

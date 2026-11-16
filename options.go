@@ -4,6 +4,7 @@ import (
 	"compress/flate"
 	"io"
 	"log/slog"
+	"net/http"
 	"path"
 	"strings"
 	"time"
@@ -23,6 +24,9 @@ const (
 	defaultHeartbeat        = 30 * time.Second
 	defaultHeartbeatTimeout = 10 * time.Second
 	defaultWriteTimeout     = 10 * time.Second
+	defaultTokenTTL         = 30 * time.Second
+	defaultPollTimeout      = 20 * time.Second
+	defaultMaxLongPolls     = 1024
 	// defaultMinCompress is the smallest payload that is compressed.
 	defaultMinCompress = 128
 	// maxMessageLimit is the largest compressed or decompressed message
@@ -49,6 +53,12 @@ type options struct {
 	authenticator      Authenticator
 	metrics            *Metrics
 	compression        compressionSettings
+	enabledTransports  map[string]bool
+	maxConns           int
+	maxLongPolls       int
+	pollTimeout        time.Duration
+	tokenTTL           time.Duration
+	middleware         []func(http.Handler) http.Handler
 }
 
 type compressionSettings struct {
@@ -71,6 +81,9 @@ func defaultOptions() options {
 		heartbeat:        defaultHeartbeat,
 		heartbeatTimeout: defaultHeartbeatTimeout,
 		writeTimeout:     defaultWriteTimeout,
+		maxLongPolls:     defaultMaxLongPolls,
+		pollTimeout:      defaultPollTimeout,
+		tokenTTL:         defaultTokenTTL,
 	}
 }
 
@@ -242,6 +255,15 @@ func (o *options) normalize() {
 	if o.log == nil {
 		o.log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	if o.maxLongPolls == 0 {
+		o.maxLongPolls = defaultMaxLongPolls
+	}
+	if o.pollTimeout == 0 {
+		o.pollTimeout = defaultPollTimeout
+	}
+	if o.tokenTTL == 0 {
+		o.tokenTTL = defaultTokenTTL
+	}
 	if !o.compression.enabled {
 		return
 	}
@@ -292,6 +314,99 @@ type CompressionConfig struct {
 	MaxDecompressedBytes  int
 	MaxCompressedBytes    int
 	MinSize               int
+}
+
+// WithTransports restricts which transports negotiation offers and which
+// endpoints accept a connection. Names are TransportWebSocket,
+// TransportSSE, and TransportLongPolling. The default is all three, in
+// that order. An unknown name panics. An empty list panics.
+// WebSocket remains the direct upgrade on the mount path when it is enabled.
+func WithTransports(names ...string) Option {
+	return func(o *options) {
+		if len(names) == 0 {
+			panic("gorealtime: WithTransports requires at least one transport")
+		}
+		set := make(map[string]bool, len(names))
+		for _, name := range names {
+			switch name {
+			case TransportWebSocket, TransportSSE, TransportLongPolling:
+				set[name] = true
+			default:
+				panic("gorealtime: unknown transport " + name)
+			}
+		}
+		o.enabledTransports = set
+	}
+}
+
+// WithMaxConnections caps registered connections. n must be at least 1.
+// A new handshake above the cap receives HTTP 503. Zero is not accepted;
+// omit the option for no cap.
+func WithMaxConnections(n int) Option {
+	return func(o *options) {
+		if n < 1 {
+			panic("gorealtime: max connections must be at least 1")
+		}
+		o.maxConns = n
+	}
+}
+
+// WithMaxLongPolls caps how many long-poll requests may wait at once
+// across the process. n must be between 1 and 100000. The default is 1024.
+func WithMaxLongPolls(n int) Option {
+	return func(o *options) {
+		if n < 1 || n > 100000 {
+			panic("gorealtime: max long polls must be between 1 and 100000")
+		}
+		o.maxLongPolls = n
+	}
+}
+
+// WithPollTimeout sets how long one long poll waits for a frame before
+// answering 204. d must be positive and at most 2 minutes. The default
+// is 20 seconds, short enough that a proxy idle timeout usually fires later.
+func WithPollTimeout(d time.Duration) Option {
+	return func(o *options) {
+		if d <= 0 || d > 2*time.Minute {
+			panic("gorealtime: poll timeout must be positive and at most 2 minutes")
+		}
+		o.pollTimeout = d
+	}
+}
+
+// WithConnectionTokenTTL sets how long a negotiated connection token may
+// sit unused before the transport is established. d must be at least one
+// second and at most five minutes. The default is 30 seconds. After the
+// transport is established the token identifies that connection until it
+// closes. It is not an application credential.
+func WithConnectionTokenTTL(d time.Duration) Option {
+	return func(o *options) {
+		if d < time.Second || d > 5*time.Minute {
+			panic("gorealtime: connection token TTL must be from 1s to 5m")
+		}
+		o.tokenTTL = d
+	}
+}
+
+// WithMiddleware wraps every request this server handles, including the
+// WebSocket upgrade. The first function is the outermost wrapper.
+// A nil function panics.
+func WithMiddleware(mw ...func(http.Handler) http.Handler) Option {
+	return func(o *options) {
+		for _, fn := range mw {
+			if fn == nil {
+				panic("gorealtime: nil middleware")
+			}
+			o.middleware = append(o.middleware, fn)
+		}
+	}
+}
+
+func (o *options) transportEnabled(name string) bool {
+	if len(o.enabledTransports) == 0 {
+		return true
+	}
+	return o.enabledTransports[name]
 }
 
 // WithCompression turns on permessage-deflate negotiation.
