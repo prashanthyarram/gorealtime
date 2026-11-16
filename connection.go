@@ -9,6 +9,7 @@ import (
 	"unicode"
 
 	"github.com/prashanthyarram/gorealtime/internal/protocol"
+	"github.com/prashanthyarram/gorealtime/internal/ws"
 )
 
 const (
@@ -144,6 +145,59 @@ func newConnection(id, remote string, sess session, server *Server) *Connection 
 
 // ID is the process-local connection id. It does not change.
 func (c *Connection) ID() string { return c.id }
+
+// CompressionStatus is the compression agreement for one connection.
+// Negotiated is false when this peer did not agree on permessage-deflate.
+// Level, MinSize, and the two limits are the server policy. They are zero
+// when the server has compression disabled.
+//
+// Extension is the Sec-WebSocket-Extensions response for this socket.
+// ServerContextTakeover is true when messages this process sends may reuse
+// a window. ClientContextTakeover is true when messages this process
+// receives may reuse a window. Both are false unless the peer negotiated
+// them. This build's window is 32,768 bytes. A smaller window is not negotiated.
+type CompressionStatus struct {
+	Negotiated            bool
+	Extension             string
+	ServerContextTakeover bool
+	ClientContextTakeover bool
+	Level                 int
+	MinSize               int
+	MaxDecompressedBytes  int
+	MaxCompressedBytes    int
+}
+
+// Compression returns the agreement for this connection.
+// A connection whose transport does not report negotiation returns
+// the server policy with Negotiated false.
+func (c *Connection) Compression() CompressionStatus {
+	if c == nil || c.server == nil {
+		return CompressionStatus{}
+	}
+	cfg := c.server.opts.compression
+	if !cfg.enabled {
+		return CompressionStatus{}
+	}
+	st := CompressionStatus{
+		Level:                cfg.level,
+		MinSize:              cfg.minSize,
+		MaxDecompressedBytes: cfg.maxDecompressed,
+		MaxCompressedBytes:   cfg.maxCompressed,
+	}
+	type reporter interface {
+		Negotiated() ws.Negotiated
+	}
+	r, ok := c.sess.(reporter)
+	if !ok {
+		return st
+	}
+	n := r.Negotiated()
+	st.Negotiated = n.Enabled
+	st.Extension = n.Extension
+	st.ServerContextTakeover = n.ServerContextTakeover
+	st.ClientContextTakeover = n.ClientContextTakeover
+	return st
+}
 
 // Context is canceled when cleanup starts. Hooks and handlers should stop
 // work when it ends. It is not the HTTP request context.

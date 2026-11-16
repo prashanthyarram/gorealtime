@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/websocket"
+	"github.com/prashanthyarram/gorealtime/internal/ws"
 )
 
 func TestSendBroadcastIdentityAndGroup(t *testing.T) {
@@ -126,13 +126,13 @@ func TestConcurrentBroadcast(t *testing.T) {
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 	defer shutdown(t, s)
-	var clients []*websocket.Conn
+	var clients []*ws.Client
 	for i := 0; i < 4; i++ {
 		c := dial(t, ts.URL, s.Path(), nil)
 		defer c.CloseNow()
 		_ = readHello(t, c)
 		clients = append(clients, c)
-		go func(c *websocket.Conn) {
+		go func(c *ws.Client) {
 			for {
 				ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 				_, _, err := c.Read(ctx)
@@ -167,7 +167,7 @@ type eventWire struct {
 	Payload json.RawMessage `json:"payload"`
 }
 
-func readEvent(t *testing.T, c *websocket.Conn) eventWire {
+func readEvent(t *testing.T, c *ws.Client) eventWire {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -175,7 +175,7 @@ func readEvent(t *testing.T, c *websocket.Conn) eventWire {
 	if err != nil {
 		t.Fatalf("read event: %v", err)
 	}
-	if typ != websocket.MessageText {
+	if typ != ws.MessageText {
 		t.Fatalf("type %v", typ)
 	}
 	var ev eventWire

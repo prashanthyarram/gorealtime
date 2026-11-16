@@ -61,6 +61,33 @@ The WebSocket read limit is the payload maximum plus 4 KiB. A frame larger than 
 
 The default payload maximum is 32 KiB. `WithMaxPayloadBytes` sets it, from 1 byte to 8 MiB.
 
+## Compression
+
+Compression is off unless the server is built with `WithCompression` and the client offers `permessage-deflate`. The server accepts that extension only when every parameter in the chosen offer is one it implements. Other extensions are left out of the response. The handshake still completes.
+
+The response lists the agreement. With the defaults, it is:
+
+```text
+permessage-deflate; server_no_context_takeover; client_no_context_takeover
+```
+
+| Parameter | What this process does |
+| --- | --- |
+| `server_no_context_takeover` | Included unless `ServerContextTakeover` is set and the client did not send this parameter. Each message the server sends then starts from an empty window. |
+| `client_no_context_takeover` | Included unless `ClientContextTakeover` is set. A client hint alone does not disable the server's inflater history, because the client may still use context takeover when the response omits the parameter. |
+| `server_max_window_bits` | Accepted only at 15. A value below 15 declines that offer. When the client sends 15, the response echoes `server_max_window_bits=15`. Otherwise the parameter is omitted, which means the same 32,768-byte window. |
+| `client_max_window_bits` | A value from 8 to 15, or the name with no value, is accepted as a hint. The response does not include it. The inflater stays at 32,768 bytes. |
+
+RSV1 is set on the first frame of a message this process compressed. It is clear on continuation frames, on uncompressed data frames, and on every control frame. A compressed message is the DEFLATE output of `compress/flate` after a sync flush, with the trailing `00 00 ff ff` removed, as RFC 7692 requires. The receiver appends those four bytes and inflates.
+
+Fragmented input is concatenated, then inflated once. This process does not fragment outbound messages.
+
+Messages shorter than `MinSize` (default 128 bytes) are sent with RSV1 clear and do not touch the compressor. When context takeover is off, a message that does not shrink is also sent uncompressed. When context takeover is on, a message that entered the compressor is sent compressed even if it grew, because the window cannot be rolled back.
+
+The compressed size is bounded by `MaxCompressedBytes`, or by the WebSocket read limit when that field is zero. The inflated size is bounded by `MaxDecompressedBytes`, or by the same read limit when that field is zero. Inflation stops when the cap is crossed. The connection is closed. There is no error envelope for that, same as any other read-limit failure.
+
+`Connection.Compression` reports the agreement for that socket, including the extension response string. The open log line includes `extensions` when negotiation succeeded.
+
 ## What a write means
 
 A successful WebSocket write means the server handed the bytes to the connection. It does not mean the client applied them, stored them, or will see them after a reconnect. Acks are how an application records that a peer claims to have seen a frame id. The library does not replay missed frames.

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/websocket"
+	"github.com/prashanthyarram/gorealtime/internal/ws"
 )
 
 func TestStressFanout(t *testing.T) {
@@ -22,12 +22,12 @@ func TestStressFanout(t *testing.T) {
 	ts := httptest.NewServer(s.Handler())
 	base := runtime.NumGoroutine()
 
-	clients := make([]*websocket.Conn, 0, n)
+	clients := make([]*ws.Client, 0, n)
 	for i := 0; i < n; i++ {
 		c := dial(t, ts.URL, s.Path(), nil)
 		_ = readHello(t, c)
 		clients = append(clients, c)
-		go func(c *websocket.Conn) {
+		go func(c *ws.Client) {
 			for {
 				if _, _, err := c.Read(context.Background()); err != nil {
 					return

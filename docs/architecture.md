@@ -6,28 +6,21 @@ This document records decisions that are expensive to reverse. Milestone notes u
 
 ## Transport
 
-WebSocket is the only transport in this release. The handshake is `internal/ws`, built on `github.com/coder/websocket` v1.8.13. The root package does not import that module. Public APIs take `net/http` values and return this module's types.
+WebSocket is the only transport in this release. The handshake and frames live in `internal/ws` and use only the standard library (`net`, `crypto/sha1`, `bufio`, `net/http`). The root package does not re-export those types. Public APIs take `net/http` values and return this module's types.
 
-`coder/websocket` is the maintained continuation of `nhooyr.io/websocket` (Coder took over maintenance in 2024). v1.8.13, released 2025-03-14, was evaluated against the needs of this library:
+`github.com/coder/websocket` v1.8.13 was the earlier choice. It is a maintained fork of `nhooyr.io/websocket`, and v1.8.13 was the newest release that compiled on Go 1.22. It was removed so this module has no external dependencies. `golang.org/x/net/websocket` is deprecated and is still a module outside the standard library. `gorilla/websocket` and `gobwas/ws` are external too. The library therefore implements the RFC 6455 subset it needs: the opening handshake, masked client frames, unmasked server frames, text and binary messages, ping/pong, close, a read-size limit, and the origin check.
 
-- Maintenance. The module is actively released. v1.8.14 (2025-09-06) and v1.8.15 (2026-06-15) continue that line.
-- Concurrency. Methods may run concurrently except `Read`. One reader is required so ping, pong, and close frames are processed. Writes are synchronized inside the library.
-- Context. `Read`, `Write`, and `Ping` take `context.Context`. Canceling or timing out that context closes the socket, including if the context is canceled after the call returns unless the library has reset its timeout to `context.Background`. Callers therefore use a fresh timeout context per write or ping and cancel it only after the call returns. The long-lived read uses `context.Background` and is unblocked with `CloseNow`.
-- Performance. The library passes the Autobahn suite, supports low-allocation reads and writes, and does not require CGo. v1.8.13 starts one internal timeout goroutine per connection. v1.8.14 removes that goroutine by using `context.AfterFunc`, which needs Go 1.23.
-- API. `Accept` works with `http.ResponseWriter` and does not force a router. Origin policy, read limits, and compression are explicit options. `Ping` waits for a pong that the read loop observes.
-- Security. Cross-origin handshakes are rejected unless the origin host matches the request host or a `path.Match` host pattern. Compression is off unless requested. The default payload limit is 32 KiB. The WebSocket read limit is that value plus 4 KiB, and this library sets it explicitly. The library does not implement the WebSocket framing itself.
+Concurrency follows the same shape as before. `Read` must not run concurrently with itself, because that is the loop that answers ping and observes pong and close. `Write`, `Ping`, and `CloseNow` may run alongside `Read`. Writes share one mutex. A context that ends during `Read`, `Write`, or `Ping` fails that call by setting a socket deadline. Canceling the context after the call returns does not close the socket. `CloseNow` closes the TCP connection and unblocks a waiting read. Host patterns match the origin host with `path.Match`, case insensitively. A missing `Origin` is allowed. The default payload limit is 32 KiB. The WebSocket read limit is that value plus 4 KiB.
 
-v1.8.14 and later set `go 1.23` in their `go.mod`. This module is built with Go 1.22, so those releases do not compile here. v1.8.13 is the newest release that does. The features left behind are real and small: scheme-aware origin patterns, `ErrMessageTooBig`, and the timeout-goroutine removal. Host patterns in v1.8.13 match the origin host only, which is the behavior this library documents. `golang.org/x/net/websocket` is deprecated. `gorilla/websocket` is widely used but its context support and close handshake are weaker, and the project has had long maintenance gaps. `gobwas/ws` is a lower-level framing toolkit; using it would mean implementing handshake and concurrency policy that `coder/websocket` already tests. None of those are a better fit than pinning v1.8.13.
+Permessage-deflate (RFC 7692) is optional and off unless `WithCompression` enables it. Negotiation lives next to the handshake. Each connection owns its own `compress/flate` writer and reader; the writer is used only under the write lock and the reader only under the read lock. RSV1 marks a compressed data message. Control frames are never compressed. The only window this process can use is 32,768 bytes, which is what `compress/flate` implements. An offer that requires `server_max_window_bits` below 15 is declined. Context takeover is off unless the application sets it, and a client's `server_no_context_takeover` is honored. `docs/protocol.md` and `docs/security.md` record the parameters and the CRIME/BREACH boundary.
 
 There is no second transport. SSE, HTTP streaming, and long polling would implement the same session operations later: read a frame, write a frame, probe liveness, and abort. They are not implemented.
 
 ## Dependencies
 
-| Module | Why |
-| --- | --- |
-| `github.com/coder/websocket` v1.8.13 | WebSocket handshake, frames, ping/pong, origin check, and read limit. See above. |
+There are none. `go.mod` has no `require` block.
 
-The standard library covers HTTP, JSON, logging (`log/slog`), and concurrency. Prometheus and OpenTelemetry are not dependencies. Metrics, when added, will be an interface the application implements.
+The standard library covers HTTP, WebSocket framing, JSON, logging (`log/slog`), and concurrency. Prometheus and OpenTelemetry are not dependencies. Metrics are optional funcs the application supplies.
 
 ## Process model
 
@@ -49,7 +42,7 @@ Cleanup is `sync.Once`. The first reason is kept.
 
 The registry mutex guards the accepting flag and both indexes. It is not held during network IO. The post-upgrade insert rechecks the accepting flag under that lock so shutdown and accept cannot lose a socket or add one after close.
 
-Each connection has one read goroutine. `coder/websocket` adds its timeout goroutine. `Shutdown` waits until the library's goroutines finish. `sync.Once` makes cleanup run once if the read loop, `Close`, and shutdown overlap.
+Each connection has one read goroutine and one write goroutine. `Shutdown` waits until those goroutines finish. `sync.Once` makes cleanup run once if the read loop, `Close`, and shutdown overlap.
 
 ## Protocol
 
@@ -80,3 +73,7 @@ Delivery is not durable. A frame that has not been written is dropped when the s
 - `OnDisconnect` does not run when `OnConnect` fails or panics. It runs after the current handler returns when the read loop is what performs cleanup.
 - Group membership and broadcast do not leave this process. `AuthorizeGroups` is optional. With no authorizer, `Join` is trusted server code.
 - A queued frame is not a delivered frame. Nothing is replayed after a reconnect. Shutdown does not flush the queue.
+- Outbound messages are one WebSocket frame. Inbound compressed messages may be fragmented; RSV1 is honored only on the first frame, and the concatenated payload is inflated once.
+- `server_max_window_bits` below 15 is not offered and is not accepted. `client_max_window_bits` is not written on the response. The inflater always keeps a 32,768-byte window, including when context takeover is off, because that is the size `compress/flate` allocates.
+- The standard-library client still does not dial `wss`. TLS remains the caller's `http.Server` or the proxy in front of it.
+- Compression does not look at event names. A secret and attacker-controlled bytes in the same frame are compressed together when compression is on. Turn it off for those sockets.

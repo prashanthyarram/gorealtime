@@ -1,11 +1,14 @@
 package gorealtime
 
 import (
+	"compress/flate"
 	"io"
 	"log/slog"
 	"path"
 	"strings"
 	"time"
+
+	"github.com/prashanthyarram/gorealtime/internal/protocol"
 )
 
 const (
@@ -20,6 +23,12 @@ const (
 	defaultHeartbeat        = 30 * time.Second
 	defaultHeartbeatTimeout = 10 * time.Second
 	defaultWriteTimeout     = 10 * time.Second
+	// defaultMinCompress is the smallest payload that is compressed.
+	defaultMinCompress = 128
+	// maxMessageLimit is the largest compressed or decompressed message
+	// a configuration may name. It matches the payload ceiling plus the
+	// envelope allowance.
+	maxMessageLimit = maxPayloadLimit + protocol.MaxOverhead
 )
 
 // Option configures a Server. Options are applied in order at NewServer.
@@ -39,6 +48,17 @@ type options struct {
 	requireAuth        bool
 	authenticator      Authenticator
 	metrics            *Metrics
+	compression        compressionSettings
+}
+
+type compressionSettings struct {
+	enabled         bool
+	level           int
+	serverContext   bool
+	clientContext   bool
+	minSize         int
+	maxDecompressed int
+	maxCompressed   int
 }
 
 func defaultOptions() options {
@@ -221,5 +241,90 @@ func (o *options) normalize() {
 	o.path = path.Clean(o.path)
 	if o.log == nil {
 		o.log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if !o.compression.enabled {
+		return
+	}
+	if o.compression.level == 0 {
+		o.compression.level = flate.DefaultCompression
+	}
+	if o.compression.minSize == 0 {
+		o.compression.minSize = defaultMinCompress
+	}
+	readLimit := o.maxPayload + protocol.MaxOverhead
+	if o.compression.maxDecompressed == 0 {
+		o.compression.maxDecompressed = readLimit
+	}
+	if o.compression.maxCompressed == 0 || o.compression.maxCompressed > readLimit {
+		// A compressed frame cannot be larger than the read the socket
+		// is willing to buffer. A higher setting would not be enforced.
+		o.compression.maxCompressed = readLimit
+	}
+}
+
+// CompressionConfig is the permessage-deflate policy for a server.
+// Compression is off unless Enabled is set. The zero value of
+// WithCompression(CompressionConfig{}) leaves compression off.
+//
+// Level 0 selects compress/flate.DefaultCompression. Explicit levels
+// are HuffmanOnly (-2), DefaultCompression (-1), and 1 through 9.
+// flate.NoCompression is not selected by 0; leave Enabled false instead.
+//
+// ServerContextTakeover and ClientContextTakeover are off unless set.
+// Off is the safe default: each message is compressed on its own, which
+// avoids carrying a secret from one frame into the next. See docs/security.md.
+//
+// MaxDecompressedBytes is the largest message accepted after inflation.
+// Zero uses the WebSocket read limit, which is the payload maximum plus
+// 4 KiB. Inflation stops when that cap is crossed.
+// MaxCompressedBytes is the largest compressed message accepted.
+// Zero uses the same read limit. A larger value is reduced to that limit
+// because the socket will not buffer more than that.
+//
+// MinSize is the smallest payload that is compressed. Zero selects 128
+// bytes. Shorter messages are sent uncompressed. Messages that do not
+// shrink, and that are not using context takeover, are also sent uncompressed.
+type CompressionConfig struct {
+	Enabled               bool
+	Level                 int
+	ServerContextTakeover bool
+	ClientContextTakeover bool
+	MaxDecompressedBytes  int
+	MaxCompressedBytes    int
+	MinSize               int
+}
+
+// WithCompression turns on permessage-deflate negotiation.
+// The extension is advertised only when the client offers a parameter
+// set this process can honor. Clients that do not offer it stay uncompressed.
+// Enabled false clears a previous WithCompression.
+func WithCompression(cfg CompressionConfig) Option {
+	return func(o *options) {
+		if !cfg.Enabled {
+			o.compression = compressionSettings{}
+			return
+		}
+		switch cfg.Level {
+		case 0, flate.DefaultCompression, flate.HuffmanOnly:
+		default:
+			if cfg.Level < flate.BestSpeed || cfg.Level > flate.BestCompression {
+				panic("gorealtime: compression level must be 0, -2, -1, or 1 through 9")
+			}
+		}
+		if cfg.MaxDecompressedBytes < 0 || cfg.MaxCompressedBytes < 0 || cfg.MinSize < 0 {
+			panic("gorealtime: compression sizes must not be negative")
+		}
+		if cfg.MaxDecompressedBytes > maxMessageLimit || cfg.MaxCompressedBytes > maxMessageLimit {
+			panic("gorealtime: compression limit is larger than 8 MiB plus 4 KiB")
+		}
+		o.compression = compressionSettings{
+			enabled:         true,
+			level:           cfg.Level,
+			serverContext:   cfg.ServerContextTakeover,
+			clientContext:   cfg.ClientContextTakeover,
+			minSize:         cfg.MinSize,
+			maxDecompressed: cfg.MaxDecompressedBytes,
+			maxCompressed:   cfg.MaxCompressedBytes,
+		}
 	}
 }

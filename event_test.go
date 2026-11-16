@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/websocket"
+	"github.com/prashanthyarram/gorealtime/internal/ws"
 )
 
 func TestEventReachesHandler(t *testing.T) {
@@ -131,7 +131,7 @@ func TestDispatchErrorsStayOnTheSocket(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := c.Write(ctx, websocket.MessageBinary, []byte{0x01, 0x02}); err != nil {
+	if err := c.Write(ctx, ws.MessageBinary, []byte{0x01, 0x02}); err != nil {
 		t.Fatal(err)
 	}
 	assertError(t, c, "", CodeInvalidMessage, "")
@@ -170,7 +170,7 @@ func TestPayloadLimits(t *testing.T) {
 	huge := strings.Repeat("y", 8000)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_ = c.Write(ctx, websocket.MessageText, []byte(huge))
+	_ = c.Write(ctx, ws.MessageText, []byte(huge))
 	waitCount(t, s, 0)
 }
 
@@ -363,7 +363,7 @@ type errorWire struct {
 	} `json:"error"`
 }
 
-func assertError(t *testing.T, c *websocket.Conn, corr, code, message string) errorWire {
+func assertError(t *testing.T, c *ws.Client, corr, code, message string) errorWire {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -387,11 +387,11 @@ func assertError(t *testing.T, c *websocket.Conn, corr, code, message string) er
 	return w
 }
 
-func sendText(t *testing.T, c *websocket.Conn, body string) {
+func sendText(t *testing.T, c *ws.Client, body string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := c.Write(ctx, websocket.MessageText, []byte(body)); err != nil {
+	if err := c.Write(ctx, ws.MessageText, []byte(body)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 }

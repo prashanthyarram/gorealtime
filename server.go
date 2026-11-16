@@ -193,6 +193,15 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		OriginPatterns:     s.opts.originPatterns,
 		InsecureSkipOrigin: s.opts.insecureSkipOrigin,
 		ReadLimit:          int64(s.opts.maxPayload) + protocol.MaxOverhead,
+		Compression: ws.Compression{
+			Enabled:               s.opts.compression.enabled,
+			Level:                 s.opts.compression.level,
+			ServerContextTakeover: s.opts.compression.serverContext,
+			ClientContextTakeover: s.opts.compression.clientContext,
+			MinSize:               s.opts.compression.minSize,
+			MaxDecompressed:       int64(s.opts.compression.maxDecompressed),
+			MaxCompressed:         int64(s.opts.compression.maxCompressed),
+		},
 	})
 	if err != nil {
 		// Accept already wrote the status. Log a bounded error string and
@@ -249,7 +258,11 @@ func (s *Server) runConnection(c *Connection) {
 	c.state = StateOpen
 	c.mu.Unlock()
 
-	s.opts.log.Info("connection.open", "id", c.ID(), "remote", c.remoteAddr)
+	if ext := negotiatedExtension(c.sess); ext != "" {
+		s.opts.log.Info("connection.open", "id", c.ID(), "remote", c.remoteAddr, "extensions", ext)
+	} else {
+		s.opts.log.Info("connection.open", "id", c.ID(), "remote", c.remoteAddr)
+	}
 
 	hello, err := encodeHello(newEventID(), s.instanceID, c.id)
 	if err != nil {
@@ -266,9 +279,8 @@ func (s *Server) runConnection(c *Connection) {
 	// Heartbeats start only once Read is the caller, so the pong has a reader.
 	c.enableHeartbeat()
 
-	// context.Background is intentional. coder/websocket treats cancellation
-	// of the read context as a failed read and closes the socket, so a read
-	// deadline cannot be expressed that way. CloseNow unblocks this call.
+	// context.Background is intentional. Ending the context passed to Read
+	// fails that read. CloseNow unblocks it by closing the socket.
 	// Handlers run inline on this goroutine, one event at a time.
 	for {
 		binary, data, err := c.sess.Read(context.Background())
@@ -375,6 +387,17 @@ func mustInstanceID() string {
 		panic("gorealtime: crypto/rand failed while creating a server: " + err.Error())
 	}
 	return id
+}
+
+func negotiatedExtension(sess session) string {
+	type reporter interface {
+		Negotiated() ws.Negotiated
+	}
+	r, ok := sess.(reporter)
+	if !ok {
+		return ""
+	}
+	return r.Negotiated().Extension
 }
 
 func boundErr(err error) string {
