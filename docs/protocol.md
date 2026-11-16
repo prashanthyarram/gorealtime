@@ -1,6 +1,32 @@
 # Protocol
 
-A gorealtime connection carries one JSON text frame per message. The server speaks version 1. Binary frames are rejected. This is not the SignalR protocol.
+A gorealtime connection carries one JSON text frame per message. The server speaks version 1. Binary frames are rejected. This is not the SignalR protocol. The same envelope is used on WebSocket, server-sent events, and long polling.
+
+## Negotiation
+
+`POST <path>/negotiate` returns the transports this process will accept, in the order a client should try them.
+
+```json
+{
+  "protocolVersion": 1,
+  "connectionId": "<id>",
+  "connectionToken": "<token>",
+  "expiresAt": "2026-01-01T00:00:00Z",
+  "availableTransports": [
+    {"name": "WebSockets", "transferFormats": ["Text"]},
+    {"name": "ServerSentEvents", "transferFormats": ["Text"]},
+    {"name": "LongPolling", "transferFormats": ["Text"]}
+  ]
+}
+```
+
+`connectionToken` expires if the transport is not established in time (default 30 seconds). After that it identifies that one connection until the connection closes. Send it in the `X-Gorealtime-Connection-Token` header. Do not put it in a query string. A second establish attempt receives HTTP 409. A missing or expired token receives HTTP 401. The token is not a user credential. The application still authenticates the HTTP request with its own middleware or authenticator. A client-supplied user id in an event payload is not an identity.
+
+WebSocket is `GET <path>` with the usual upgrade headers. The token header is optional there. SSE is `GET <path>/sse` and requires the token. The response is `text/event-stream`. Each envelope is one `data:` field. A heartbeat is a comment line, `: ping`. Long polling is `GET <path>/poll`. The body is `{"messages":[<envelope>, ...]}`. An empty wait ends as HTTP 204. Client events for SSE and long polling are `POST <path>/send` with one envelope and the same token. The response is HTTP 202 when the frame was queued for the connection's read loop, which is not the same as the handler having finished.
+
+`ShouldFallback` is the client rule. Fall back only when the attempt never became an authenticated session: no TCP connection, HTTP 404, 501, 502, or 504. Do not fall back on 400, 401, 403, 409, 413, 429, or 503.
+
+A queued or written frame is not an acknowledged frame. Reconnect does not replay. The server does not promise exactly-once delivery.
 
 ## Envelope
 
@@ -63,7 +89,7 @@ The default payload maximum is 32 KiB. `WithMaxPayloadBytes` sets it, from 1 byt
 
 ## Compression
 
-Compression is off unless the server is built with `WithCompression` and the client offers `permessage-deflate`. The server accepts that extension only when every parameter in the chosen offer is one it implements. Other extensions are left out of the response. The handshake still completes.
+Permessage-deflate applies only to WebSocket. Negotiation lists it on the WebSocket transport, and only when `WithCompression` has enabled it. Server-sent events and long polling do not negotiate it and do not set RSV1. When the client sends `Accept-Encoding: gzip` (or `x-gzip` or `*` with a non-zero quality), those HTTP responses are gzip content-coded and flushed per event. `gzip;q=0` and a missing `Accept-Encoding` leave the body as identity. An existing `Content-Encoding` is left alone. WebSocket compression is off unless the server is built with `WithCompression` and the client offers `permessage-deflate`. The server accepts that extension only when every parameter in the chosen offer is one it implements. Other extensions are left out of the response. The handshake still completes.
 
 The response lists the agreement. With the defaults, it is:
 

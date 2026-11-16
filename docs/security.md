@@ -24,13 +24,15 @@ Canceling the context passed to a long-lived `Read` also closes the socket, so t
 
 ## What is not checked
 
-The library does not parse `X-Forwarded-For`. `RemoteAddr` is the peer the HTTP server sees. A reverse proxy that should hide clients has to overwrite that before the handler, and it has to forward `Connection: Upgrade` and `Upgrade: websocket` without buffering the byte stream.
+The library does not parse `X-Forwarded-For` or any other forwarded header. `RemoteAddr` is the peer the HTTP server sees. A reverse proxy that should hide clients has to overwrite that before the handler, and it has to forward `Connection: Upgrade` and `Upgrade: websocket` without buffering the byte stream. There is no trusted-proxy mode that reads those headers.
+
+The negotiate token is scoped to one connection. It is compared as a map key, it is not logged, and it is not accepted from the query string. CORS echoes an allowed `Origin` and does not use `*`. A rejected origin is HTTP 403 on the HTTP transports and is not a reason to try the next transport.
 
 Join, broadcast, and send are authorized only when the application installed an authorizer or checked inside the handler. There is no JWT implementation and no permission model for rooms.
 
 ## Compression
 
-`WithCompression` is off unless `Enabled` is set. Leave it off for sockets that carry tokens, session identifiers, or other secrets in the same frame as data a peer can influence.
+`WithCompression` is off unless `Enabled` is set, and it applies only to WebSocket. Leave it off for sockets that carry tokens, session identifiers, or other secrets in the same frame as data a peer can influence. Server-sent events and long polling ignore that setting. They gzip an HTTP response only when the request's `Accept-Encoding` asks for gzip and no `Content-Encoding` is already set.
 
 Permessage-deflate is the same class of leak as CRIME and BREACH. The ciphertext length depends on how well the plaintext compresses. An attacker who can choose part of a message and observe the compressed size can learn about the other bytes in that compression window. Context takeover extends the window across messages, so a secret in one frame can affect the size of a later frame. The default agreement sends `server_no_context_takeover` and `client_no_context_takeover`, which keeps each message in its own window. That does not make a single mixed frame safe.
 

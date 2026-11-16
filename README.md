@@ -1,8 +1,8 @@
 # gorealtime
 
-`gorealtime` is a Go library for process-local realtime delivery over WebSocket. You mount it on your own `net/http` server, and it accepts sockets, assigns a connection id, and keeps the connection until the peer leaves or you shut the server down.
+`gorealtime` is a Go library for process-local realtime delivery. WebSocket is the primary transport. Server-sent events and HTTP long polling are fallbacks for clients that cannot open a socket. You mount it on your own `net/http` server. It accepts connections, assigns a connection id, and keeps the connection until the peer leaves or you shut the server down.
 
-It does not implement a chat product. It does not store messages, users, or memberships, and it does not speak the SignalR protocol. Authentication and authorization belong to the application. The library can require an identity, call an authenticator, and run authorizers the application supplies. It does not issue tokens or decide who may speak in a room.
+It does not implement a chat product, a notification product, or a user system. It does not store messages or replay them after a disconnect. Authentication and authorization belong to the application. The library can read an identity your middleware already stored, call an authenticator you supply, and run authorizers you supply. It does not issue, refresh, or interpret application credentials. The negotiate token only binds one live connection to a transport.
 
 ## Install
 
@@ -10,7 +10,7 @@ It does not implement a chat product. It does not store messages, users, or memb
 go get github.com/prashanthyarram/gorealtime
 ```
 
-The module requires Go 1.22 and has no external dependencies. WebSocket framing is implemented with the standard library. See `docs/architecture.md`.
+The module requires Go 1.22 and has no external dependencies. WebSocket framing, SSE, and long polling use the standard library. See `docs/architecture.md`.
 
 ## Server
 
@@ -35,7 +35,7 @@ func main() {
 }
 ```
 
-`examples/basic` is the same server. A client that completes the handshake receives one text frame:
+`examples/basic` is the same server. `examples/fallback` is the negotiate endpoint. A client that completes a WebSocket handshake receives one text frame:
 
 ```json
 {"v":1,"type":"hello","id":"<event-id>","origin":"<instance-id>","payload":{"connectionId":"<connection-id>"}}

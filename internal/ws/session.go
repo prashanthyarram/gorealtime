@@ -171,6 +171,12 @@ func (s *Session) CloseNow() error {
 	return s.w.CloseNow()
 }
 
+// OriginOK reports whether r's Origin is allowed by patterns.
+// A missing Origin is allowed. skip accepts every Origin.
+func OriginOK(r *http.Request, patterns []string, skip bool) bool {
+	return originAllowed(r, patterns, skip)
+}
+
 func originAllowed(r *http.Request, patterns []string, skip bool) bool {
 	if skip {
 		return true

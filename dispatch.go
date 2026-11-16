@@ -83,6 +83,7 @@ func (s *Server) handleFrame(c *Connection, binary bool, data []byte) error {
 	env, err := protocol.DecodeClient(data, s.opts.maxPayload)
 	if err != nil {
 		code, msg := protocolFault(err)
+		s.noteProtocolError()
 		s.opts.log.Info("frame.reject", "id", c.ID(), "code", code)
 		return s.writeError(c, "", code, msg)
 	}

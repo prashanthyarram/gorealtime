@@ -32,8 +32,10 @@ type Server struct {
 	opts       options
 	instanceID string
 
-	reg    registry
-	groups groupTable
+	reg     registry
+	groups  groupTable
+	tickets *ticketTable
+	polls   *pollGate
 
 	hookMu       sync.Mutex
 	onConnect    []ConnectHandler
@@ -60,13 +62,17 @@ func NewServer(opts ...Option) *Server {
 		}
 	}
 	o.normalize()
-	return &Server{
+	s := &Server{
 		opts:       o,
 		instanceID: mustInstanceID(),
 		reg:        newRegistry(),
 		groups:     newGroupTable(),
+		tickets:    newTicketTable(),
+		polls:      &pollGate{max: o.maxLongPolls},
 		shutDone:   make(chan struct{}),
 	}
+	s.reg.maxConns = o.maxConns
+	return s
 }
 
 // Path returns the path RegisterRoutes mounts.
@@ -122,16 +128,7 @@ func (s *Server) OnDisconnect(h DisconnectHandler) {
 	s.hookMu.Unlock()
 }
 
-// Handler is the handshake endpoint. Mount it at the path clients should dial.
-// The handler does not inspect the request path; the router decides that.
-func (s *Server) Handler() http.Handler {
-	return http.HandlerFunc(s.serveHTTP)
-}
-
-// RegisterRoutes mounts Handler at Path.
-func (s *Server) RegisterRoutes(mux RouteRegistrar) {
-	mux.Handle(s.opts.path, s.Handler())
-}
+// RegisterRoutes is implemented in routes.go. Handler is ServeHTTP.
 
 // Shutdown stops new handshakes and closes open connections.
 // It waits until connection goroutines exit or ctx ends. A canceled ctx does
@@ -165,28 +162,62 @@ func (s *Server) beginShutdown() {
 	})
 }
 
-func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
+func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
+	if !s.opts.transportEnabled(TransportWebSocket) {
+		http.Error(w, "transport disabled", http.StatusNotFound)
+		return
+	}
 	if !s.reg.acceptingNow() {
 		http.Error(w, "server closed", http.StatusServiceUnavailable)
 		return
 	}
-
-	identity, meta, ok := s.authenticate(w, r)
-	if !ok {
+	if s.overCapacity() {
+		http.Error(w, "too many connections", http.StatusServiceUnavailable)
 		return
 	}
 
-	id, err := newID()
-	if err != nil {
-		s.opts.log.Error("connection.id", "err", err.Error())
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+	var (
+		id       string
+		identity string
+		meta     map[string]string
+		token    string
+	)
+	if tokenFrom(r) != "" {
+		tk, code := s.tickets.claim(tokenFrom(r), time.Now())
+		if tk == nil {
+			if code == http.StatusUnauthorized {
+				s.noteAuthFailed()
+			}
+			http.Error(w, http.StatusText(code), code)
+			return
+		}
+		token = tk.token
+		id = tk.id
+		var ok bool
+		identity, meta, ok = s.authenticate(w, r)
+		if !ok {
+			s.tickets.release(token)
+			return
+		}
+	} else {
+		var ok bool
+		identity, meta, ok = s.authenticate(w, r)
+		if !ok {
+			return
+		}
+		var err error
+		id, err = newID()
+		if err != nil {
+			s.opts.log.Error("connection.id", "err", err.Error())
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	sess, err := ws.Upgrade(w, r, ws.Config{
@@ -206,25 +237,27 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Accept already wrote the status. Log a bounded error string and
 		// not the request headers.
+		if token != "" {
+			s.tickets.release(token)
+		}
 		s.opts.log.Warn("connection.upgrade", "remote", r.RemoteAddr, "err", boundErr(err))
 		return
 	}
 
 	c := newConnection(id, r.RemoteAddr, sess, s)
 	c.configureQueue(s.opts.queueSize, s.opts.slowTimeout)
-	if !s.reg.insert(c, func() { s.wg.Add(2) }) {
-		c.finish(ReasonShutdown)
+	c.transport = TransportWebSocket
+	c.accessToken = token
+	if token != "" {
+		s.tickets.attach(token, nil, c, identity, meta)
+	}
+	s.noteTransport(TransportWebSocket)
+	if !s.launch(c, identity, meta) {
+		if token != "" {
+			s.tickets.drop(token)
+		}
 		return
 	}
-	if err := c.applyAuth(identity, meta); err != nil {
-		c.finish(ReasonConnectRejected)
-		s.wg.Done()
-		s.wg.Done()
-		return
-	}
-	s.noteOpened()
-	go c.writeLoop()
-	go s.runConnection(c)
 }
 
 func (s *Server) runConnection(c *Connection) {
@@ -259,9 +292,9 @@ func (s *Server) runConnection(c *Connection) {
 	c.mu.Unlock()
 
 	if ext := negotiatedExtension(c.sess); ext != "" {
-		s.opts.log.Info("connection.open", "id", c.ID(), "remote", c.remoteAddr, "extensions", ext)
+		s.opts.log.Info("connection.open", "id", c.ID(), "remote", c.remoteAddr, "transport", c.transport, "extensions", ext)
 	} else {
-		s.opts.log.Info("connection.open", "id", c.ID(), "remote", c.remoteAddr)
+		s.opts.log.Info("connection.open", "id", c.ID(), "remote", c.remoteAddr, "transport", c.transport)
 	}
 
 	hello, err := encodeHello(newEventID(), s.instanceID, c.id)
@@ -286,10 +319,14 @@ func (s *Server) runConnection(c *Connection) {
 		binary, data, err := c.sess.Read(context.Background())
 		if err != nil {
 			var ce *ws.CloseError
-			if errors.As(err, &ce) {
+			switch {
+			case errors.As(err, &ce):
 				reason = ReasonClientClose
 				s.opts.log.Info("connection.read", "id", c.ID(), "status", ce.Code)
-			} else {
+			case errors.Is(err, errClientGone):
+				reason = ReasonClientClose
+				s.opts.log.Info("connection.read", "id", c.ID(), "err", "client gone")
+			default:
 				s.opts.log.Info("connection.read", "id", c.ID(), "err", boundErr(err))
 			}
 			return
